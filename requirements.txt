@@ -1,0 +1,7 @@
+streamlit==1.32.0
+libsql-experimental==0.0.39
+pandas==2.2.0
+plotly==5.18.0
+bcrypt==4.1.2
+fpdf2==2.7.8
+python-dotenv==1.0.1
