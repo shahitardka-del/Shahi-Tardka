@@ -43,17 +43,38 @@ st.markdown("""
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
+    /* Print button styled as red button */
+    .print-btn {
+        display: inline-block;
+        background: linear-gradient(90deg, #dc2626, #b45309);
+        color: #fff !important;
+        padding: 10px 24px;
+        border-radius: 10px;
+        text-decoration: none !important;
+        font-weight: 600;
+        margin-top: 8px;
+        cursor: pointer;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ============================================================
-#               DATE HELPER
+#               HELPERS
 # ============================================================
 
 def fmt_date(d):
-    """Return date as dd-mm-yyyy."""
+    """Return date as dd-mm-yyyy (day-month-year)."""
+    if d is None:
+        return ""
     if isinstance(d, str):
+        # Try to parse if it's ISO
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                dt = datetime.strptime(d, fmt)
+                return dt.strftime("%d-%m-%Y")
+            except Exception:
+                continue
         return d
     try:
         return d.strftime("%d-%m-%Y")
@@ -61,8 +82,22 @@ def fmt_date(d):
         return str(d)
 
 
+def to_iso(d):
+    """Convert date to ISO for DB storage."""
+    if isinstance(d, str):
+        return d
+    return d.strftime("%Y-%m-%d")
+
+
+def title_case(s):
+    """First character capital of each word."""
+    if s is None:
+        return ""
+    return str(s).title()
+
+
 # ============================================================
-#               DATABASE LAYER (Optimized)
+#               DATABASE
 # ============================================================
 
 @st.cache_resource
@@ -74,7 +109,6 @@ def get_db():
 
 
 def run(sql, args=()):
-    """Write operation - clears cache."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
@@ -85,7 +119,6 @@ def run(sql, args=()):
 
 @st.cache_data(ttl=600, show_spinner=False, max_entries=100)
 def q(sql, args=()):
-    """Cached SELECT."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
@@ -93,23 +126,35 @@ def q(sql, args=()):
     return pd.DataFrame(cur.fetchall(), columns=cols)
 
 
+# ============================================================
+#               SHORT SERIAL GENERATOR
+# ============================================================
+
 def next_serial(prefix, table, column):
-    """Generate short serial: INV-0001, BILL-0001 etc."""
+    """
+    Generate short serial by scanning ALL existing numbers
+    and picking the smallest unused one. Format: INV-1, BILL-1
+    """
     try:
-        df = q(f"SELECT {column} FROM {table} ORDER BY id DESC LIMIT 1")
-        if len(df) and df.iloc[0][column]:
-            last = str(df.iloc[0][column])
-            parts = last.split("-")
-            if len(parts) >= 2 and parts[-1].isdigit():
-                n = int(parts[-1]) + 1
-                return f"{prefix}-{n:04d}"
+        df = q(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
+        used = set()
+        for v in df[column].tolist():
+            s = str(v)
+            if "-" in s:
+                try:
+                    used.add(int(s.split("-")[-1]))
+                except Exception:
+                    pass
+        n = 1
+        while n in used:
+            n += 1
+        return f"{prefix}-{n}"
     except Exception:
-        pass
-    return f"{prefix}-0001"
+        return f"{prefix}-1"
 
 
 # ============================================================
-#               DB INITIALIZATION
+#               DB INIT (with historical price tables)
 # ============================================================
 
 @st.cache_resource
@@ -138,16 +183,31 @@ def init_db():
     );
     CREATE TABLE IF NOT EXISTS raw_materials (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL, unit TEXT DEFAULT 'kg',
+        name TEXT NOT NULL, unit TEXT DEFAULT 'Kg',
         rate REAL DEFAULT 0, stock_qty REAL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL, sku TEXT, unit TEXT DEFAULT 'pcs',
+        name TEXT NOT NULL, sku TEXT, unit TEXT DEFAULT 'Pcs',
         sale_price REAL DEFAULT 0, cost_price REAL DEFAULT 0,
         stock_qty REAL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS product_price_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        sale_price REAL NOT NULL,
+        cost_price REAL NOT NULL,
+        effective_from DATETIME DEFAULT CURRENT_TIMESTAMP,
+        changed_by TEXT
+    );
+    CREATE TABLE IF NOT EXISTS raw_material_price_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        raw_material_id INTEGER NOT NULL,
+        rate REAL NOT NULL,
+        effective_from DATETIME DEFAULT CURRENT_TIMESTAMP,
+        changed_by TEXT
     );
     CREATE TABLE IF NOT EXISTS sales (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -159,7 +219,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sale_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sale_id INTEGER, product_id INTEGER,
-        qty REAL NOT NULL, rate REAL NOT NULL, amount REAL NOT NULL
+        product_name TEXT, qty REAL NOT NULL,
+        rate REAL NOT NULL, amount REAL NOT NULL
     );
     CREATE TABLE IF NOT EXISTS purchases (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,7 +232,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS purchase_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         purchase_id INTEGER, raw_material_id INTEGER,
-        qty REAL NOT NULL, rate REAL NOT NULL, amount REAL NOT NULL
+        raw_name TEXT, qty REAL NOT NULL,
+        rate REAL NOT NULL, amount REAL NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sale_returns (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +244,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS sale_return_items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         return_id INTEGER, product_id INTEGER,
-        qty REAL NOT NULL, rate REAL NOT NULL, amount REAL NOT NULL
+        product_name TEXT, qty REAL NOT NULL,
+        rate REAL NOT NULL, amount REAL NOT NULL
     );
     CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -200,7 +263,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS production_materials (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         production_id INTEGER, raw_material_id INTEGER,
-        qty_used REAL NOT NULL, rate REAL NOT NULL, amount REAL NOT NULL
+        raw_name TEXT, qty_used REAL NOT NULL,
+        rate REAL NOT NULL, amount REAL NOT NULL
     );
     CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,33 +276,46 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
     CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
     CREATE INDEX IF NOT EXISTS idx_transactions_party ON transactions(party_type, party_id);
+    CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
     CREATE INDEX IF NOT EXISTS idx_purchases_vendor ON purchases(vendor_id);
     CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
-    CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
+    CREATE INDEX IF NOT EXISTS idx_prod_price_history ON product_price_history(product_id);
+    CREATE INDEX IF NOT EXISTS idx_rm_price_history ON raw_material_price_history(raw_material_id);
     """
     for stmt in schema.split(";"):
         s = stmt.strip()
         if s:
             cur.execute(s)
+
+    # Migrate: add name columns if old DB
+    for tbl, col in [("sale_items", "product_name"), ("purchase_items", "raw_name"),
+                     ("sale_return_items", "product_name"), ("production_materials", "raw_name")]:
+        try:
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
+        except Exception:
+            pass
+
     cur.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
         pw = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
         cur.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", ("admin", pw))
+
     cur.execute("SELECT COUNT(*) FROM products")
     if cur.fetchone()[0] == 0:
         items = [
-            ("Chili Powder 250 g", 250, 0, 250), ("Chili Powder 100 g", 100, 0, 100),
-            ("Chili Flakes 250 g", 250, 0, 250), ("Chili Flakes 100 g", 100, 0, 100),
-            ("Turmeric Powder 250 g", 250, 0, 250), ("Turmeric Powder 100 g", 100, 0, 100),
-            ("Chili 20 Rs.", 20, 0, 20), ("Chili 10 Rs.", 10, 0, 10),
-            ("Turmeric 20 Rs.", 20, 0, 20), ("Turmeric 10 Rs.", 10, 0, 10),
+            ("Chili Powder 250 G", 250, 0, 250), ("Chili Powder 100 G", 100, 0, 100),
+            ("Chili Flakes 250 G", 250, 0, 250), ("Chili Flakes 100 G", 100, 0, 100),
+            ("Turmeric Powder 250 G", 250, 0, 250), ("Turmeric Powder 100 G", 100, 0, 100),
+            ("Chili 20 Rs", 20, 0, 20), ("Chili 10 Rs", 10, 0, 10),
+            ("Turmeric 20 Rs", 20, 0, 20), ("Turmeric 10 Rs", 10, 0, 10),
             ("Whole Coriander", 1, 0, 0), ("Other Spices", 1, 0, 0),
         ]
         for name, price, cost, stock in items:
             cur.execute(
                 "INSERT INTO products (name, sale_price, cost_price, stock_qty, unit) VALUES (?,?,?,?,?)",
-                (name, price, cost, stock, "pcs"),
+                (name, price, cost, stock, "Pcs"),
             )
+
     conn.commit()
     return True
 
@@ -285,6 +362,77 @@ user = st.session_state.user
 
 
 # ============================================================
+#               PDF HELPERS
+# ============================================================
+
+def build_pdf(title, headers, rows, summary=None, extra_header=None):
+    """Build PDF in memory, return base64 string."""
+    pdf = FPDF()
+    pdf.add_page()
+    # Company header only (no app link)
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_text_color(220, 38, 38)
+    pdf.cell(0, 10, "SHAHI TARDKA", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(100)
+    pdf.cell(0, 6, "Premium Spices & Foods", ln=True, align="C")
+    pdf.ln(3)
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(0)
+    pdf.cell(0, 8, title, ln=True, align="C")
+    pdf.ln(2)
+
+    if extra_header:
+        pdf.set_font("Helvetica", "", 10)
+        for line in extra_header:
+            pdf.cell(0, 6, line, ln=True)
+        pdf.ln(2)
+
+    if headers:
+        col_w = 190 / len(headers)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_fill_color(220, 38, 38)
+        pdf.set_text_color(255)
+        for h in headers:
+            pdf.cell(col_w, 8, str(h)[:25], 1, 0, "C", True)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(0)
+        for r in rows:
+            for c in r:
+                pdf.cell(col_w, 7, str(c)[:30], 1, 0, "L")
+            pdf.ln()
+        pdf.ln(3)
+
+    if summary:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(220, 38, 38)
+        for line in summary:
+            pdf.cell(0, 7, line, ln=True, align="R")
+
+    return base64.b64encode(bytes(pdf.output())).decode()
+
+
+def direct_print_button(pdf_b64, filename, label="🖨️ Print Now", key=None):
+    """
+    Direct print — opens new window with PDF auto-print.
+    No download, no save dialog.
+    """
+    html = f"""
+    <a href="data:application/pdf;base64,{pdf_b64}"
+       target="_blank"
+       onclick="setTimeout(function(){{window.print();}}, 800); return true;"
+       style="display:inline-block;background:linear-gradient(90deg,#dc2626,#b45309);
+              color:#fff;padding:12px 26px;border-radius:10px;text-decoration:none;
+              font-weight:700;font-size:15px;box-shadow:0 4px 12px rgba(220,38,38,0.3);">
+        {label}
+    </a>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+
+
+# ============================================================
 #               SIDEBAR
 # ============================================================
 
@@ -309,61 +457,12 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
 
 
 # ============================================================
-#               HELPER: PDF builder for tables
-# ============================================================
-
-def build_pdf_table(title, headers, rows, summary=None):
-    """Build a PDF with title and table. Returns base64."""
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.set_text_color(220, 38, 38)
-    pdf.cell(0, 10, "SHAHI TARDKA", ln=True, align="C")
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(100)
-    pdf.cell(0, 6, "Premium Spices & Foods", ln=True, align="C")
-    pdf.ln(3)
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.set_text_color(0)
-    pdf.cell(0, 8, title, ln=True, align="C")
-    pdf.ln(3)
-
-    # Table
-    col_w = 190 / len(headers)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.set_fill_color(220, 38, 38)
-    pdf.set_text_color(255)
-    for h in headers:
-        pdf.cell(col_w, 8, str(h), 1, 0, "C", True)
-    pdf.ln()
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(0)
-    for r in rows:
-        for c in r:
-            pdf.cell(col_w, 7, str(c)[:30], 1, 0, "L")
-        pdf.ln()
-    pdf.ln(3)
-
-    if summary:
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(220, 38, 38)
-        for line in summary:
-            pdf.cell(0, 7, line, ln=True, align="R")
-
-    return base64.b64encode(bytes(pdf.output())).decode()
-
-
-def pdf_link(b64, filename, label="🖨️ Print / Download PDF"):
-    return f'<a href="data:application/pdf;base64,{b64}" download="{filename}" target="_blank" style="display:inline-block;background:linear-gradient(90deg,#dc2626,#b45309);color:#fff;padding:10px 20px;border-radius:10px;text-decoration:none;font-weight:600;margin-top:8px;">{label}</a>'
-
-
-# ============================================================
 #               DASHBOARD
 # ============================================================
 
 if menu == "📊 Dashboard":
     st.markdown("<h1 class='big-title'>Dashboard</h1>", unsafe_allow_html=True)
-    st.caption("Real-time overview of your business")
+    st.caption("Real-Time Overview Of Your Business")
 
     summary = q("""
         SELECT
@@ -390,11 +489,12 @@ if menu == "📊 Dashboard":
                  WHERE date >= date('now','-14 days')
                  GROUP BY date ORDER BY date""")
         if len(d):
-            fig = px.area(d, x="date", y="total", title="Last 14 Days Sales",
+            d["date_display"] = d["date"].apply(fmt_date)
+            fig = px.area(d, x="date_display", y="total", title="Last 14 Days Sales",
                           color_discrete_sequence=["#dc2626"])
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.info("No sales yet")
+            st.info("No Sales Yet")
 
     with col2:
         m = q("""SELECT substr(date,1,7) as month, SUM(total) as total FROM sales
@@ -404,14 +504,14 @@ if menu == "📊 Dashboard":
                          color_discrete_sequence=["#b45309"])
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
-            st.info("No sales yet")
+            st.info("No Sales Yet")
 
     st.markdown("### ⚠️ Low Stock Alerts")
     low = q("SELECT name, stock_qty FROM products WHERE stock_qty < 10 ORDER BY stock_qty LIMIT 8")
     if len(low):
         st.dataframe(low, use_container_width=True, hide_index=True)
     else:
-        st.success("All products sufficiently stocked ✅")
+        st.success("All Products Sufficiently Stocked ✅")
 
 
 # ============================================================
@@ -425,13 +525,12 @@ elif menu == "🛒 Sale Entry":
     products = q("SELECT id, name, sale_price, stock_qty FROM products ORDER BY name")
 
     if len(customers) == 0 or len(products) == 0:
-        st.warning("Pehle Customers aur Products add karo")
+        st.warning("Pehle Customers Aur Products Add Karo")
         st.stop()
 
     if "cart" not in st.session_state:
         st.session_state.cart = []
 
-    # Auto serial
     if "auto_inv" not in st.session_state:
         st.session_state.auto_inv = next_serial("INV", "sales", "invoice_no")
 
@@ -440,7 +539,7 @@ elif menu == "🛒 Sale Entry":
         cust = st.selectbox("Customer", customers["name"].tolist())
         cust_id = int(customers[customers["name"] == cust].iloc[0]["id"])
     with col2:
-        inv_date = st.date_input("Date", value=date.today())
+        inv_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY")
     with col3:
         inv_no = st.text_input("Invoice #", value=st.session_state.auto_inv)
 
@@ -479,18 +578,19 @@ elif menu == "🛒 Sale Entry":
         if colA.button("💾 Save Sale", use_container_width=True):
             cur = run(
                 "INSERT INTO sales (invoice_no, customer_id, date, total, discount, paid) VALUES (?,?,?,?,?,?)",
-                (inv_no, cust_id, str(inv_date), total, discount, paid),
+                (inv_no, cust_id, to_iso(inv_date), total, discount, paid),
             )
             sale_id = cur.lastrowid
             for it in st.session_state.cart:
-                run("INSERT INTO sale_items (sale_id, product_id, qty, rate, amount) VALUES (?,?,?,?,?)",
-                    (sale_id, it["product_id"], it["qty"], it["rate"], it["amount"]))
+                run("""INSERT INTO sale_items (sale_id, product_id, product_name, qty, rate, amount)
+                       VALUES (?,?,?,?,?,?)""",
+                    (sale_id, it["product_id"], it["name"], it["qty"], it["rate"], it["amount"]))
                 run("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
                     (it["qty"], it["product_id"]))
             if paid > 0:
                 run("""INSERT INTO transactions (date, type, party_type, party_id, amount, description)
                        VALUES (?,?,?,?,?,?)""",
-                    (str(inv_date), "cash_receipt", "customer", cust_id, paid, f"Sale {inv_no}"))
+                    (to_iso(inv_date), "cash_receipt", "customer", cust_id, paid, f"Sale {inv_no}"))
             st.success(f"✅ Saved: {inv_no}")
             st.session_state.cart = []
             st.session_state.auto_inv = next_serial("INV", "sales", "invoice_no")
@@ -512,7 +612,7 @@ elif menu == "🛒 Sale Entry":
             pdf.set_font("Helvetica", "", 11)
             pdf.cell(0, 6, f"Invoice: {inv_no}", ln=True)
             pdf.cell(0, 6, f"Date: {fmt_date(inv_date)}", ln=True)
-            pdf.cell(0, 6, f"Customer: {cust}", ln=True)
+            pdf.cell(0, 6, f"Customer: {title_case(cust)}", ln=True)
             pdf.ln(3)
             pdf.set_font("Helvetica", "B", 10)
             pdf.set_fill_color(220, 38, 38)
@@ -538,8 +638,8 @@ elif menu == "🛒 Sale Entry":
             pdf.set_text_color(0)
             pdf.cell(140, 7, "Paid:", 0, 0, "R"); pdf.cell(35, 7, f"{paid:.2f}", 0, 1, "R")
             pdf.cell(140, 7, "Balance:", 0, 0, "R"); pdf.cell(35, 7, f"{(total-paid):.2f}", 0, 1, "R")
-            b64 = base64.b64encode(bytes(pdf.output())).decode()
-            st.markdown(pdf_link(b64, f"{inv_no}.pdf", "📄 Download / Print Invoice"), unsafe_allow_html=True)
+            pdf_b64 = base64.b64encode(bytes(pdf.output())).decode()
+            direct_print_button(pdf_b64, f"{inv_no}.pdf", "🖨️ Print Invoice Now")
 
 
 # ============================================================
@@ -552,7 +652,7 @@ elif menu == "🛍️ Purchase Entry":
     raws = q("SELECT id, name, rate, unit FROM raw_materials ORDER BY name")
 
     if len(vendors) == 0 or len(raws) == 0:
-        st.warning("Pehle Vendors aur Raw Materials add karo")
+        st.warning("Pehle Vendors Aur Raw Materials Add Karo")
         st.stop()
 
     if "p_cart" not in st.session_state:
@@ -566,7 +666,7 @@ elif menu == "🛍️ Purchase Entry":
         v = st.selectbox("Vendor", vendors["name"].tolist())
         v_id = int(vendors[vendors["name"] == v].iloc[0]["id"])
     with c2:
-        p_date = st.date_input("Date", value=date.today(), key="p_date")
+        p_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY", key="p_date")
     with c3:
         bill_no = st.text_input("Bill #", value=st.session_state.auto_bill)
 
@@ -585,7 +685,6 @@ elif menu == "🛍️ Purchase Entry":
             st.session_state.p_cart.append({
                 "raw_material_id": int(r_row["id"]), "name": rname,
                 "qty": pqty, "rate": prate, "amount": pqty * prate,
-                "unit": r_row["unit"] if "unit" in r_row else "kg",
             })
             st.rerun()
 
@@ -599,18 +698,24 @@ elif menu == "🛍️ Purchase Entry":
         if cA.button("💾 Save Purchase", use_container_width=True):
             cur = run(
                 "INSERT INTO purchases (bill_no, vendor_id, date, total, paid) VALUES (?,?,?,?,?)",
-                (bill_no, v_id, str(p_date), p_total, paid_p),
+                (bill_no, v_id, to_iso(p_date), p_total, paid_p),
             )
             pid = cur.lastrowid
             for it in st.session_state.p_cart:
-                run("INSERT INTO purchase_items (purchase_id, raw_material_id, qty, rate, amount) VALUES (?,?,?,?,?)",
-                    (pid, it["raw_material_id"], it["qty"], it["rate"], it["amount"]))
+                # Save item with name snapshot
+                run("""INSERT INTO purchase_items (purchase_id, raw_material_id, raw_name, qty, rate, amount)
+                       VALUES (?,?,?,?,?,?)""",
+                    (pid, it["raw_material_id"], it["name"], it["qty"], it["rate"], it["amount"]))
+                # ADD to stock (not replace)
                 run("UPDATE raw_materials SET stock_qty = stock_qty + ?, rate = ? WHERE id = ?",
                     (it["qty"], it["rate"], it["raw_material_id"]))
+                # Save price history
+                run("""INSERT INTO raw_material_price_history (raw_material_id, rate, changed_by)
+                       VALUES (?,?,?)""", (it["raw_material_id"], it["rate"], user["username"]))
             if paid_p > 0:
                 run("""INSERT INTO transactions (date, type, party_type, party_id, amount, description)
                        VALUES (?,?,?,?,?,?)""",
-                    (str(p_date), "cash_payment", "vendor", v_id, paid_p, f"Purchase {bill_no}"))
+                    (to_iso(p_date), "cash_payment", "vendor", v_id, paid_p, f"Purchase {bill_no}"))
             st.success(f"✅ Saved: {bill_no}")
             st.session_state.p_cart = []
             st.session_state.auto_bill = next_serial("BILL", "purchases", "bill_no")
@@ -630,7 +735,7 @@ elif menu == "↩️ Sale Return":
     products = q("SELECT id, name, sale_price FROM products ORDER BY name")
 
     if len(customers) == 0 or len(products) == 0:
-        st.warning("Pehle Customers aur Products add karo")
+        st.warning("Pehle Customers Aur Products Add Karo")
         st.stop()
 
     if "r_cart" not in st.session_state:
@@ -644,7 +749,7 @@ elif menu == "↩️ Sale Return":
         rc = st.selectbox("Customer", customers["name"].tolist())
         rc_id = int(customers[customers["name"] == rc].iloc[0]["id"])
     with c2:
-        r_date = st.date_input("Date", value=date.today(), key="r_date")
+        r_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY", key="r_date")
     with c3:
         r_no = st.text_input("Return #", value=st.session_state.auto_ret)
 
@@ -673,15 +778,16 @@ elif menu == "↩️ Sale Return":
         if st.button("💾 Save Return", use_container_width=True):
             cur = run(
                 "INSERT INTO sale_returns (return_no, customer_id, date, total) VALUES (?,?,?,?)",
-                (r_no, rc_id, str(r_date), r_total),
+                (r_no, rc_id, to_iso(r_date), r_total),
             )
             rid = cur.lastrowid
             for it in st.session_state.r_cart:
-                run("INSERT INTO sale_return_items (return_id, product_id, qty, rate, amount) VALUES (?,?,?,?,?)",
-                    (rid, it["product_id"], it["qty"], it["rate"], it["amount"]))
+                run("""INSERT INTO sale_return_items (return_id, product_id, product_name, qty, rate, amount)
+                       VALUES (?,?,?,?,?,?)""",
+                    (rid, it["product_id"], it["name"], it["qty"], it["rate"], it["amount"]))
                 run("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
                     (it["qty"], it["product_id"]))
-            st.success(f"✅ Return saved: {r_no}")
+            st.success(f"✅ Return Saved: {r_no}")
             st.session_state.r_cart = []
             st.session_state.auto_ret = next_serial("RET", "sale_returns", "return_no")
             st.rerun()
@@ -697,7 +803,7 @@ elif menu == "💰 Cash / Bank":
     with st.form("txn"):
         c1, c2 = st.columns(2)
         with c1:
-            t_date = st.date_input("Date", value=date.today())
+            t_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY")
             t_type = st.selectbox("Type", ["Cash Receipt", "Cash Payment", "Bank Receipt", "Bank Payment"])
             t_type_db = t_type.lower().replace(" ", "_")
         with c2:
@@ -714,7 +820,7 @@ elif menu == "💰 Cash / Bank":
             p_id = int(parties[parties["name"] == p_name].iloc[0]["id"])
             run("""INSERT INTO transactions (date, type, party_type, party_id, amount, description)
                    VALUES (?,?,?,?,?,?)""",
-                (str(t_date), t_type_db, p_type.lower(), p_id, amount, desc))
+                (to_iso(t_date), t_type_db, p_type.lower(), p_id, amount, desc))
             st.success("✅ Saved")
             st.rerun()
 
@@ -723,6 +829,8 @@ elif menu == "💰 Cash / Bank":
               FROM transactions ORDER BY id DESC LIMIT 50""")
     if len(df):
         df["date"] = df["date"].apply(fmt_date)
+        df["type"] = df["type"].apply(lambda x: str(x).replace("_", " ").title())
+        df["party_type"] = df["party_type"].apply(lambda x: str(x).title())
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
@@ -737,15 +845,21 @@ elif menu == "📦 Stock Report":
 
     with t1:
         df = q("SELECT id, name, sku, unit, sale_price, cost_price, stock_qty FROM products ORDER BY name")
+        if len(df):
+            df.columns = [c.replace("_", " ").title() for c in df.columns]
         st.dataframe(df, use_container_width=True, hide_index=True)
-        total_val = (df["stock_qty"] * df["cost_price"]).sum()
-        st.metric("Total Stock Value (at cost)", f"Rs. {total_val:,.0f}")
+        if len(df):
+            total_val = (df["Stock Qty"] * df["Cost Price"]).sum()
+            st.metric("Total Stock Value (At Cost)", f"Rs. {total_val:,.0f}")
 
     with t2:
         df2 = q("SELECT id, name, unit, rate, stock_qty FROM raw_materials ORDER BY name")
+        if len(df2):
+            df2["Weight"] = df2.apply(lambda r: f"{r['stock_qty']:g} {r['unit']}", axis=1)
+            df2.columns = [c.replace("_", " ").title() for c in df2.columns]
         st.dataframe(df2, use_container_width=True, hide_index=True)
         if len(df2):
-            total_val2 = (df2["stock_qty"] * df2["rate"]).sum()
+            total_val2 = (df2["Stock Qty"] * df2["Rate"]).sum()
             st.metric("Total Raw Material Value", f"Rs. {total_val2:,.0f}")
 
 
@@ -754,12 +868,12 @@ elif menu == "📦 Stock Report":
 # ============================================================
 
 elif menu == "🏭 Production":
-    st.markdown("<h1 class='big-title'>Production (with Wastage)</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 class='big-title'>Production (With Wastage)</h1>", unsafe_allow_html=True)
     products = q("SELECT id, name FROM products ORDER BY name")
     raws = q("SELECT id, name, rate FROM raw_materials ORDER BY name")
 
     if len(products) == 0:
-        st.warning("Pehle Products add karo")
+        st.warning("Pehle Products Add Karo")
         st.stop()
 
     if "prod_mats" not in st.session_state:
@@ -767,14 +881,14 @@ elif menu == "🏭 Production":
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        pr_date = st.date_input("Date", value=date.today(), key="pr_date")
+        pr_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY", key="pr_date")
     with c2:
         pr_prod = st.selectbox("Product Produced", products["name"].tolist())
         pr_pid = int(products[products["name"] == pr_prod].iloc[0]["id"])
     with c3:
         qty_prod = st.number_input("Qty Produced", min_value=0.01, value=1.0)
 
-    wastage = st.number_input("Wastage (in same unit)", min_value=0.0, value=0.0)
+    wastage = st.number_input("Wastage (In Same Unit)", min_value=0.0, value=0.0)
     notes = st.text_input("Notes")
 
     st.markdown("### Raw Materials Used")
@@ -805,17 +919,21 @@ elif menu == "🏭 Production":
         if st.button("💾 Save Production", use_container_width=True):
             cur = run(
                 "INSERT INTO production (date, product_id, qty_produced, wastage, notes) VALUES (?,?,?,?,?)",
-                (str(pr_date), pr_pid, qty_prod, wastage, notes),
+                (to_iso(pr_date), pr_pid, qty_prod, wastage, notes),
             )
             prod_id = cur.lastrowid
             for it in st.session_state.prod_mats:
-                run("INSERT INTO production_materials (production_id, raw_material_id, qty_used, rate, amount) VALUES (?,?,?,?,?)",
-                    (prod_id, it["raw_material_id"], it["qty"], it["rate"], it["amount"]))
+                run("""INSERT INTO production_materials (production_id, raw_material_id, raw_name, qty_used, rate, amount)
+                       VALUES (?,?,?,?,?,?)""",
+                    (prod_id, it["raw_material_id"], it["name"], it["qty"], it["rate"], it["amount"]))
                 run("UPDATE raw_materials SET stock_qty = stock_qty - ? WHERE id = ?",
                     (it["qty"], it["raw_material_id"]))
             run("UPDATE products SET stock_qty = stock_qty + ?, cost_price = ? WHERE id = ?",
                 (qty_prod, total_cost / qty_prod if qty_prod else 0, pr_pid))
-            st.success("✅ Production saved")
+            run("""INSERT INTO product_price_history (product_id, sale_price, cost_price, changed_by)
+                   VALUES (?, (SELECT sale_price FROM products WHERE id=?), ?, ?)""",
+                (pr_pid, pr_pid, total_cost / qty_prod if qty_prod else 0, user["username"]))
+            st.success("✅ Production Saved")
             st.session_state.prod_mats = []
             st.rerun()
 
@@ -825,6 +943,7 @@ elif menu == "🏭 Production":
                 ORDER BY p.id DESC LIMIT 30""")
     if len(hist):
         hist["date"] = hist["date"].apply(fmt_date)
+        hist.columns = [c.replace("_", " ").title() for c in hist.columns]
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
 
@@ -838,7 +957,7 @@ elif menu == "🧾 Expenses":
     with st.form("exp"):
         c1, c2, c3 = st.columns(3)
         with c1:
-            e_date = st.date_input("Date", value=date.today())
+            e_date = st.date_input("Date", value=date.today(), format="DD/MM/YYYY")
         with c2:
             cat = st.text_input("Category", value="General")
         with c3:
@@ -846,7 +965,7 @@ elif menu == "🧾 Expenses":
         desc = st.text_input("Description")
         if st.form_submit_button("💾 Save Expense") and amt > 0:
             run("INSERT INTO expenses (date, category, amount, description) VALUES (?,?,?,?)",
-                (str(e_date), cat, amt, desc))
+                (to_iso(e_date), title_case(cat), amt, desc))
             st.success("✅ Saved")
             st.rerun()
 
@@ -854,19 +973,20 @@ elif menu == "🧾 Expenses":
     df = q("SELECT * FROM expenses ORDER BY id DESC LIMIT 50")
     if len(df):
         df["date"] = df["date"].apply(fmt_date)
+        df.columns = [c.replace("_", " ").title() for c in df.columns]
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # ============================================================
-#               LEDGER (Updated: date range + print)
+#               LEDGER
 # ============================================================
 
 elif menu == "📒 Ledger":
     st.markdown("<h1 class='big-title'>Customer & Vendor Ledger</h1>", unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns([1, 2, 2])
+    c1, c2, c3, c4 = st.columns([1, 2, 1.5, 1.5])
     with c1:
-        ltype = st.radio("Select", ["Customer", "Vendor"], horizontal=False)
+        ltype = st.radio("Select", ["Customer", "Vendor"])
     if ltype == "Customer":
         parties = q("SELECT id, name, opening_balance FROM customers ORDER BY name")
         party_type = "customer"
@@ -875,7 +995,7 @@ elif menu == "📒 Ledger":
         party_type = "vendor"
 
     if len(parties) == 0:
-        st.info(f"No {ltype}s added yet")
+        st.info(f"No {ltype}s Added Yet")
         st.stop()
 
     with c2:
@@ -883,16 +1003,13 @@ elif menu == "📒 Ledger":
         p_row = parties[parties["name"] == p_name].iloc[0]
         p_id = int(p_row["id"])
     with c3:
-        date_from = st.date_input("From Date", value=date.today().replace(day=1))
-        date_to = st.date_input("To Date", value=date.today())
+        date_from = st.date_input("From Date", value=date.today().replace(day=1), format="DD/MM/YYYY")
+    with c4:
+        date_to = st.date_input("To Date", value=date.today(), format="DD/MM/YYYY")
 
     opening = float(p_row["opening_balance"] or 0)
-    d_from = fmt_date(date_from)
-    d_to = fmt_date(date_to)
-
-    # Convert to ISO for SQL comparison if dates stored as YYYY-MM-DD
-    iso_from = date_from.strftime("%Y-%m-%d")
-    iso_to = date_to.strftime("%Y-%m-%d")
+    iso_from = to_iso(date_from)
+    iso_to = to_iso(date_to)
 
     txn = q("""SELECT date, type, amount, description
                FROM transactions
@@ -900,28 +1017,30 @@ elif menu == "📒 Ledger":
                  AND date BETWEEN ? AND ?
                ORDER BY date""", (party_type, p_id, iso_from, iso_to))
 
-    total_debit = 0
-    total_paid = 0
+    # Debit/Credit depending on customer vs vendor
+    total_debit = 0.0
+    total_credit = 0.0
     rows = []
     balance = opening
     for _, r in txn.iterrows():
         amt = float(r["amount"] or 0)
-        is_payment = "payment" in str(r["type"]).lower()
-        if is_payment:
-            balance -= amt
-            total_paid += amt
-            debit = 0
-            credit = amt
-        else:
-            balance += amt
-            total_debit += amt
-            debit = amt
-            credit = 0
+        typ = str(r["type"]).lower()
+        is_payment_out = "payment" in typ
+        if party_type == "customer":
+            if is_payment_out:
+                balance -= amt; total_credit += amt; dr, cr = 0, amt
+            else:
+                balance += amt; total_debit += amt; dr, cr = amt, 0
+        else:  # vendor
+            if is_payment_out:
+                balance += amt; total_credit += amt; dr, cr = 0, amt
+            else:
+                balance -= amt; total_debit += amt; dr, cr = amt, 0
         rows.append([
             fmt_date(r["date"]),
-            str(r["type"]).replace("_", " ").title(),
-            f"{debit:.2f}" if debit else "",
-            f"{credit:.2f}" if credit else "",
+            title_case(str(r["type"]).replace("_", " ")),
+            f"{dr:.2f}" if dr else "",
+            f"{cr:.2f}" if cr else "",
             f"{balance:.2f}",
             str(r["description"] or ""),
         ])
@@ -929,7 +1048,7 @@ elif menu == "📒 Ledger":
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Opening Balance", f"Rs. {opening:,.0f}")
     m2.metric("Total Debit", f"Rs. {total_debit:,.0f}")
-    m3.metric("Total Credit", f"Rs. {total_paid:,.0f}")
+    m3.metric("Total Credit", f"Rs. {total_credit:,.0f}")
     m4.metric("Closing Balance", f"Rs. {balance:,.0f}")
 
     st.markdown("### Transactions")
@@ -939,22 +1058,22 @@ elif menu == "📒 Ledger":
             use_container_width=True, hide_index=True
         )
     else:
-        st.info("No transactions in this date range")
+        st.info("No Transactions In This Date Range")
 
-    # Print button
-    if st.button("🖨️ Print Ledger"):
-        b64 = build_pdf_table(
-            f"{ltype} Ledger: {p_name} ({d_from} to {d_to})",
+    if st.button("🖨️ Prepare Ledger Print"):
+        b64 = build_pdf(
+            f"{ltype} Ledger — {title_case(p_name)}",
             ["Date", "Type", "Debit", "Credit", "Balance", "Description"],
             rows,
             [
+                f"Period: {fmt_date(date_from)} To {fmt_date(date_to)}",
                 f"Opening Balance: Rs. {opening:,.2f}",
                 f"Total Debit: Rs. {total_debit:,.2f}",
-                f"Total Credit: Rs. {total_paid:,.2f}",
+                f"Total Credit: Rs. {total_credit:,.2f}",
                 f"Closing Balance: Rs. {balance:,.2f}",
             ]
         )
-        st.markdown(pdf_link(b64, f"Ledger_{p_name}_{d_from}_{d_to}.pdf"), unsafe_allow_html=True)
+        direct_print_button(b64, f"Ledger_{p_name}.pdf", "🖨️ Print Ledger Now")
 
 
 # ============================================================
@@ -966,31 +1085,34 @@ elif menu == "📈 Reports":
     tab1, tab2, tab3, tab4 = st.tabs(["Sales", "Purchases", "Expenses", "Profit & Loss"])
 
     with tab1:
-        d1 = st.date_input("From", value=date.today().replace(day=1), key="s_from")
-        d2 = st.date_input("To", value=date.today(), key="s_to")
+        d1 = st.date_input("From", value=date.today().replace(day=1), key="s_from", format="DD/MM/YYYY")
+        d2 = st.date_input("To", value=date.today(), key="s_to", format="DD/MM/YYYY")
         df = q("SELECT * FROM sales WHERE date BETWEEN ? AND ? ORDER BY date DESC",
-               (d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d")))
+               (to_iso(d1), to_iso(d2)))
         if len(df):
             df["date"] = df["date"].apply(fmt_date)
+            df.columns = [c.replace("_", " ").title() for c in df.columns]
         st.dataframe(df, use_container_width=True, hide_index=True)
         if len(df):
-            st.metric("Total Sales", f"Rs. {df['total'].sum():,.0f}")
+            st.metric("Total Sales", f"Rs. {df['Total'].sum():,.0f}")
 
     with tab2:
         df = q("SELECT * FROM purchases ORDER BY date DESC LIMIT 100")
         if len(df):
             df["date"] = df["date"].apply(fmt_date)
+            df.columns = [c.replace("_", " ").title() for c in df.columns]
         st.dataframe(df, use_container_width=True, hide_index=True)
         if len(df):
-            st.metric("Total Purchases", f"Rs. {df['total'].sum():,.0f}")
+            st.metric("Total Purchases", f"Rs. {df['Total'].sum():,.0f}")
 
     with tab3:
         df = q("SELECT * FROM expenses ORDER BY date DESC LIMIT 100")
         if len(df):
             df["date"] = df["date"].apply(fmt_date)
+            df.columns = [c.replace("_", " ").title() for c in df.columns]
         st.dataframe(df, use_container_width=True, hide_index=True)
         if len(df):
-            st.metric("Total Expenses", f"Rs. {df['amount'].sum():,.0f}")
+            st.metric("Total Expenses", f"Rs. {df['Amount'].sum():,.0f}")
 
     with tab4:
         pl = q("""
@@ -1018,7 +1140,7 @@ elif menu == "📈 Reports":
 
 
 # ============================================================
-#               PRODUCTS
+#               PRODUCTS (with price history)
 # ============================================================
 
 elif menu == "🍽️ Products":
@@ -1037,13 +1159,20 @@ elif menu == "🍽️ Products":
                 cp = st.number_input("Cost Price", min_value=0.0, value=0.0)
                 sq = st.number_input("Opening Stock", min_value=0.0, value=0.0)
             if st.form_submit_button("Add Product") and n:
-                run("INSERT INTO products (name, sku, unit, sale_price, cost_price, stock_qty) VALUES (?,?,?,?,?,?)",
-                    (n, sku, unit, sp, cp, sq))
+                cur = run("""INSERT INTO products (name, sku, unit, sale_price, cost_price, stock_qty)
+                             VALUES (?,?,?,?,?,?)""",
+                          (title_case(n), sku, unit, sp, cp, sq))
+                pid = cur.lastrowid
+                run("""INSERT INTO product_price_history (product_id, sale_price, cost_price, changed_by)
+                       VALUES (?,?,?,?)""", (pid, sp, cp, user["username"]))
                 st.success("✅ Added")
                 st.rerun()
 
     df = q("SELECT * FROM products ORDER BY name")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    display_df = df.copy()
+    if len(display_df):
+        display_df.columns = [c.replace("_", " ").title() for c in display_df.columns]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.markdown("### ✏️ Edit / Delete")
     if len(df):
@@ -1062,23 +1191,36 @@ elif menu == "🍽️ Products":
                 nsq = st.number_input("Stock", value=float(row["stock_qty"]))
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
+                # Save history BEFORE update
+                run("""INSERT INTO product_price_history (product_id, sale_price, cost_price, changed_by)
+                       VALUES (?,?,?,?)""", (int(row["id"]), nsp, ncp, user["username"]))
                 run("""UPDATE products SET name=?, sku=?, unit=?, sale_price=?, cost_price=?, stock_qty=?
-                       WHERE id=?""", (nn, nsku, nun, nsp, ncp, nsq, int(row["id"])))
-                st.success("Updated")
+                       WHERE id=?""", (title_case(nn), nsku, nun, nsp, ncp, nsq, int(row["id"])))
+                st.success("Updated — Old Prices Kept In History")
                 st.rerun()
             if cc2.form_submit_button("🗑️ Delete"):
                 run("DELETE FROM products WHERE id=?", (int(row["id"]),))
                 st.success("Deleted")
                 st.rerun()
 
+        # Show price history
+        st.markdown("### 📜 Price History")
+        hist = q("""SELECT effective_from, sale_price, cost_price, changed_by
+                    FROM product_price_history WHERE product_id = ?
+                    ORDER BY effective_from DESC LIMIT 20""", (int(row["id"]),))
+        if len(hist):
+            hist["effective_from"] = hist["effective_from"].apply(lambda x: fmt_date(str(x)[:10]))
+            hist.columns = ["Effective From", "Sale Price", "Cost Price", "Changed By"]
+        st.dataframe(hist, use_container_width=True, hide_index=True)
+
 
 # ============================================================
-#               RAW MATERIALS (Updated: weight + unit)
+#               RAW MATERIALS (with additive stock + history)
 # ============================================================
 
 elif menu == "🧂 Raw Materials":
     st.markdown("<h1 class='big-title'>Raw Materials</h1>", unsafe_allow_html=True)
-    st.caption("Raw material ke saath uska weight aur unit likho — jaise 1000 kg, 500 g, 5 ton")
+    st.caption("Weight Aur Unit Ke Saath — Jaise 1000 Kg, 500 G, 5 Ton. Naya Add Karne Se Purana Nahi Hatega.")
 
     with st.form("add_rm"):
         c1, c2, c3, c4 = st.columns(4)
@@ -1088,21 +1230,39 @@ elif menu == "🧂 Raw Materials":
             unit_options = ["Kg", "G", "Ton", "Liter", "Ml", "Pcs", "Packet", "Box"]
             unit = st.selectbox("Unit", unit_options)
         with c3:
-            rate = st.number_input("Rate (per unit)", min_value=0.0, value=0.0)
+            rate = st.number_input("Rate (Per Unit)", min_value=0.0, value=0.0)
         with c4:
             stock = st.number_input("Opening Stock / Weight", min_value=0.0, value=0.0,
-                                    help="Jaise 1000 likho — matlab 1000 kg")
+                                    help="Jaise 1000 likho — Matlab 1000 Kg")
         if st.form_submit_button("Add Raw Material") and n:
-            run("INSERT INTO raw_materials (name, unit, rate, stock_qty) VALUES (?,?,?,?)",
-                (n, unit, rate, stock))
-            st.success(f"✅ Added: {n} ({stock} {unit})")
+            # Check if same name + unit exists
+            existing = q("SELECT id, stock_qty FROM raw_materials WHERE name = ? AND unit = ?",
+                         (title_case(n), unit))
+            if len(existing):
+                # Append to existing stock
+                old_stock = float(existing.iloc[0]["stock_qty"] or 0)
+                new_stock = old_stock + float(stock)
+                rid = int(existing.iloc[0]["id"])
+                run("UPDATE raw_materials SET stock_qty = ?, rate = ? WHERE id = ?",
+                    (new_stock, rate, rid))
+                st.success(f"✅ Existing Stock Updated: {old_stock} + {stock} = {new_stock} {unit}")
+            else:
+                cur = run("INSERT INTO raw_materials (name, unit, rate, stock_qty) VALUES (?,?,?,?)",
+                          (title_case(n), unit, rate, stock))
+                rid = cur.lastrowid
+                st.success(f"✅ New Added: {title_case(n)} ({stock} {unit})")
+            run("""INSERT INTO raw_material_price_history (raw_material_id, rate, changed_by)
+                   VALUES (?,?,?)""", (rid, rate, user["username"]))
             st.rerun()
 
     df = q("SELECT * FROM raw_materials ORDER BY name")
     if len(df):
-        # Display weight column "1000 Kg" style
         df["Weight"] = df.apply(lambda r: f"{r['stock_qty']:g} {r['unit']}", axis=1)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+        display_df = df[["id", "name", "unit", "rate", "Weight", "stock_qty", "created_at"]].copy()
+        display_df.columns = ["ID", "Name", "Unit", "Rate", "Weight", "Stock Qty", "Created At"]
+    else:
+        display_df = df
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     st.markdown("### ✏️ Edit / Delete")
     if len(df):
@@ -1118,14 +1278,26 @@ elif menu == "🧂 Raw Materials":
                 nstock = st.number_input("Weight / Stock", value=float(row["stock_qty"]))
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
+                run("""INSERT INTO raw_material_price_history (raw_material_id, rate, changed_by)
+                       VALUES (?,?,?)""", (int(row["id"]), nrate, user["username"]))
                 run("UPDATE raw_materials SET name=?, unit=?, rate=?, stock_qty=? WHERE id=?",
-                    (nn, nun, nrate, nstock, int(row["id"])))
-                st.success("Updated")
+                    (title_case(nn), nun, nrate, nstock, int(row["id"])))
+                st.success("Updated — Old Rates Kept In History")
                 st.rerun()
             if cc2.form_submit_button("🗑️ Delete"):
                 run("DELETE FROM raw_materials WHERE id=?", (int(row["id"]),))
                 st.success("Deleted")
                 st.rerun()
+
+        # Price history
+        st.markdown("### 📜 Rate History")
+        hist = q("""SELECT effective_from, rate, changed_by
+                    FROM raw_material_price_history WHERE raw_material_id = ?
+                    ORDER BY effective_from DESC LIMIT 20""", (int(row["id"]),))
+        if len(hist):
+            hist["effective_from"] = hist["effective_from"].apply(lambda x: fmt_date(str(x)[:10]))
+            hist.columns = ["Effective From", "Rate", "Changed By"]
+        st.dataframe(hist, use_container_width=True, hide_index=True)
 
 
 # ============================================================
@@ -1147,12 +1319,15 @@ elif menu == "👥 Customers":
             ob = st.number_input("Opening Balance", value=0.0)
         if st.form_submit_button("Add Customer") and n:
             run("INSERT INTO customers (name, phone, address, opening_balance) VALUES (?,?,?,?)",
-                (n, ph, ad, ob))
+                (title_case(n), ph, ad, ob))
             st.success("✅ Added")
             st.rerun()
 
     df = q("SELECT * FROM customers ORDER BY name")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    display_df = df.copy()
+    if len(display_df):
+        display_df.columns = [c.replace("_", " ").title() for c in display_df.columns]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     if len(df):
         st.markdown("### ✏️ Edit / Delete")
@@ -1171,7 +1346,7 @@ elif menu == "👥 Customers":
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
                 run("UPDATE customers SET name=?, phone=?, address=?, opening_balance=? WHERE id=?",
-                    (nn, nph, nad, nob, int(row["id"])))
+                    (title_case(nn), nph, nad, nob, int(row["id"])))
                 st.success("Updated")
                 st.rerun()
             if cc2.form_submit_button("🗑️ Delete"):
@@ -1199,12 +1374,15 @@ elif menu == "🚚 Vendors":
             ob = st.number_input("Opening Balance", value=0.0)
         if st.form_submit_button("Add Vendor") and n:
             run("INSERT INTO vendors (name, phone, address, opening_balance) VALUES (?,?,?,?)",
-                (n, ph, ad, ob))
+                (title_case(n), ph, ad, ob))
             st.success("✅ Added")
             st.rerun()
 
     df = q("SELECT * FROM vendors ORDER BY name")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    display_df = df.copy()
+    if len(display_df):
+        display_df.columns = [c.replace("_", " ").title() for c in display_df.columns]
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
     if len(df):
         st.markdown("### ✏️ Edit / Delete")
@@ -1223,7 +1401,7 @@ elif menu == "🚚 Vendors":
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
                 run("UPDATE vendors SET name=?, phone=?, address=?, opening_balance=? WHERE id=?",
-                    (nn, nph, nad, nob, int(row["id"])))
+                    (title_case(nn), nph, nad, nob, int(row["id"])))
                 st.success("Updated")
                 st.rerun()
             if cc2.form_submit_button("🗑️ Delete"):
@@ -1238,7 +1416,7 @@ elif menu == "🚚 Vendors":
 
 elif menu == "⚙️ Master Setup":
     st.markdown("<h1 class='big-title'>Master Setup</h1>", unsafe_allow_html=True)
-    st.info("Yahan se apna password change karo, aur business info dekh sakte ho.")
+    st.info("Yahan Se Apna Password Change Karo, Aur Business Info Dekh Sakte Ho.")
 
     with st.form("chpw"):
         old = st.text_input("Old Password", type="password")
@@ -1248,9 +1426,9 @@ elif menu == "⚙️ Master Setup":
             if bcrypt.checkpw(old.encode(), df.iloc[0]["password_hash"].encode()):
                 h = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
                 run("UPDATE users SET password_hash=? WHERE id=?", (h, user["id"]))
-                st.success("✅ Password changed")
+                st.success("✅ Password Changed")
             else:
-                st.error("Old password incorrect")
+                st.error("Old Password Incorrect")
 
     st.markdown("---")
     st.markdown("### 📊 Database Summary")
@@ -1277,7 +1455,8 @@ elif menu == "💾 Backup / Restore":
     st.markdown("### ⬇️ Download Backup (CSV)")
     tables = ["products", "customers", "vendors", "raw_materials", "sales",
               "sale_items", "purchases", "purchase_items", "expenses", "transactions",
-              "sale_returns", "sale_return_items", "production", "production_materials"]
+              "sale_returns", "sale_return_items", "production", "production_materials",
+              "product_price_history", "raw_material_price_history"]
     if st.button("📥 Generate Backup"):
         for t in tables:
             try:
@@ -1296,8 +1475,8 @@ elif menu == "💾 Backup / Restore":
     st.markdown("---")
     st.markdown("### ☁️ Turso Auto-Backup")
     st.info("""
-    Turso automatically backs up your database. Aap Turso dashboard se snapshots le sakte ho:
-    1. https://turso.tech/app par jao
-    2. Apna database select karo
-    3. "Snapshots" tab me jao
+    Turso Automatically Backs Up Your Database. Aap Turso Dashboard Se Snapshots Le Sakte Ho:
+    1. https://turso.tech/app Par Jao
+    2. Apna Database Select Karo
+    3. "Snapshots" Tab Me Jao
     """)
