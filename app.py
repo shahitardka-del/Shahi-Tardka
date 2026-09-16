@@ -342,11 +342,10 @@ user = st.session_state.user
 
 
 # ============================================================
-#               HTML BUILDERS FOR PRINT (DIRECT PRINT)
+#               HTML BUILDERS FOR DIRECT PRINT
 # ============================================================
 
 def esc(s):
-    """Escape HTML entities."""
     if s is None:
         return ""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
@@ -354,7 +353,6 @@ def esc(s):
 
 
 def html_table(headers, rows, summary=None, title="", extra_header=None):
-    """Build printable HTML string."""
     h = """
     <!DOCTYPE html>
     <html><head><meta charset="utf-8">
@@ -422,15 +420,50 @@ def html_table(headers, rows, summary=None, title="", extra_header=None):
 
 
 def direct_print(html_str, height=1):
-    """Render HTML in hidden iframe and auto-trigger window.print()."""
     components.html(html_str, height=height, scrolling=False)
 
 
-def print_button(html_str, label="🖨️ Print Now", key=None):
-    """Button that triggers direct print when clicked."""
-    if st.button(label, key=key, use_container_width=False):
-        direct_print(html_str)
-        st.success("✅ Print dialog khul gaya — apna printer select karein")
+# ============================================================
+#               LEDGER ITEM HELPER (Naya Function)
+# ============================================================
+
+def get_items_for_txn(party_type, party_id, date_str, description):
+    """
+    Transaction ke description se related items nikaalo.
+    - 'Sale INV-5' -> sale_items se product names
+    - 'Purchase BILL-3' -> purchase_items se raw names
+    """
+    try:
+        desc = str(description or "")
+
+        # Sale receipt: 'Sale INV-5'
+        if party_type == "customer" and desc.startswith("Sale "):
+            inv_no = desc.replace("Sale ", "").strip()
+            df = q("""SELECT si.product_name, si.qty, si.rate, si.amount
+                      FROM sale_items si
+                      JOIN sales s ON si.sale_id = s.id
+                      WHERE s.invoice_no = ?""", (inv_no,))
+            if len(df):
+                parts = []
+                for _, r in df.iterrows():
+                    parts.append(f"{r['product_name']} ({r['qty']:g} x Rs.{r['rate']:g})")
+                return " + ".join(parts)
+
+        # Purchase payment: 'Purchase BILL-3'
+        if party_type == "vendor" and desc.startswith("Purchase "):
+            bill_no = desc.replace("Purchase ", "").strip()
+            df = q("""SELECT pi.raw_name, pi.qty, pi.rate
+                      FROM purchase_items pi
+                      JOIN purchases p ON pi.purchase_id = p.id
+                      WHERE p.bill_no = ?""", (bill_no,))
+            if len(df):
+                parts = []
+                for _, r in df.iterrows():
+                    parts.append(f"{r['raw_name']} ({r['qty']:g} x Rs.{r['rate']:g})")
+                return " + ".join(parts)
+    except Exception:
+        pass
+    return str(description or "")
 
 
 # ============================================================
@@ -600,7 +633,6 @@ elif menu == "🛒 Sale Entry":
             st.session_state.cart = []
             st.rerun()
 
-        # ---- PRINT INVOICE (DIRECT) ----
         if colC.button("🖨️ Print Invoice", use_container_width=True):
             rows = []
             for i, it in enumerate(st.session_state.cart, 1):
@@ -972,7 +1004,7 @@ elif menu == "🧾 Expenses":
 
 
 # ============================================================
-#               LEDGER
+#               LEDGER  (UPDATED - Item Names in Type Column)
 # ============================================================
 
 elif menu == "📒 Ledger":
@@ -1029,9 +1061,22 @@ elif menu == "📒 Ledger":
                 balance += amt; total_credit += amt; dr, cr = 0, amt
             else:
                 balance -= amt; total_debit += amt; dr, cr = amt, 0
+
+        # Transaction type label
+        type_label = title_case(str(r["type"]).replace("_", " "))
+
+        # Get items for this transaction (SAAL ka main change)
+        items_detail = get_items_for_txn(party_type, p_id, r["date"], r["description"])
+
+        # Show type with item names
+        if items_detail and items_detail != str(r["description"] or ""):
+            type_display = f"{type_label}: {items_detail}"
+        else:
+            type_display = type_label
+
         rows.append([
             fmt_date(r["date"]),
-            title_case(str(r["type"]).replace("_", " ")),
+            type_display,
             f"{dr:.2f}" if dr else "",
             f"{cr:.2f}" if cr else "",
             f"{balance:.2f}",
@@ -1053,7 +1098,6 @@ elif menu == "📒 Ledger":
     else:
         st.info("No Transactions In This Date Range")
 
-    # ---- PRINT LEDGER (DIRECT) ----
     if st.button("🖨️ Print Ledger"):
         html_str = html_table(
             ["Date", "Type", "Debit", "Credit", "Balance", "Description"],
