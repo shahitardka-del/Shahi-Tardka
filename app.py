@@ -8,7 +8,7 @@ from fpdf import FPDF
 import base64
 
 # ============================================================
-#               PAGE CONFIG (must be first)
+#               PAGE CONFIG
 # ============================================================
 st.set_page_config(
     page_title="Shahi Tardka - Business Manager",
@@ -18,7 +18,7 @@ st.set_page_config(
 )
 
 # ============================================================
-#               CUSTOM CSS (Creative Theme)
+#               CUSTOM CSS
 # ============================================================
 st.markdown("""
 <style>
@@ -48,12 +48,25 @@ st.markdown("""
 
 
 # ============================================================
-#               DATABASE LAYER (MAX OPTIMIZED)
+#               DATE HELPER
+# ============================================================
+
+def fmt_date(d):
+    """Return date as dd-mm-yyyy."""
+    if isinstance(d, str):
+        return d
+    try:
+        return d.strftime("%d-%m-%Y")
+    except Exception:
+        return str(d)
+
+
+# ============================================================
+#               DATABASE LAYER (Optimized)
 # ============================================================
 
 @st.cache_resource
 def get_db():
-    """DB connection - single instance, cached forever."""
     return libsql.connect(
         st.secrets["TURSO_URL"],
         auth_token=st.secrets["TURSO_TOKEN"]
@@ -61,19 +74,18 @@ def get_db():
 
 
 def run(sql, args=()):
-    """INSERT/UPDATE/DELETE - clears read cache after write."""
+    """Write operation - clears cache."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
     conn.commit()
-    # Sirf relevant cache clear karo, poori cache nahi
     q.clear()
     return cur
 
 
 @st.cache_data(ttl=600, show_spinner=False, max_entries=100)
 def q(sql, args=()):
-    """SELECT queries - cached 10 min. Ye speed ka asal raaz hai."""
+    """Cached SELECT."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
@@ -81,13 +93,27 @@ def q(sql, args=()):
     return pd.DataFrame(cur.fetchall(), columns=cols)
 
 
+def next_serial(prefix, table, column):
+    """Generate short serial: INV-0001, BILL-0001 etc."""
+    try:
+        df = q(f"SELECT {column} FROM {table} ORDER BY id DESC LIMIT 1")
+        if len(df) and df.iloc[0][column]:
+            last = str(df.iloc[0][column])
+            parts = last.split("-")
+            if len(parts) >= 2 and parts[-1].isdigit():
+                n = int(parts[-1]) + 1
+                return f"{prefix}-{n:04d}"
+    except Exception:
+        pass
+    return f"{prefix}-0001"
+
+
 # ============================================================
-#               DB INITIALIZATION (runs once per session)
+#               DB INITIALIZATION
 # ============================================================
 
 @st.cache_resource
 def init_db():
-    """Schema create + seed - sirf ek baar chalta hai."""
     conn = get_db()
     cur = conn.cursor()
     schema = """
@@ -188,6 +214,7 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_transactions_party ON transactions(party_type, party_id);
     CREATE INDEX IF NOT EXISTS idx_purchases_vendor ON purchases(vendor_id);
     CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
+    CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
     """
     for stmt in schema.split(";"):
         s = stmt.strip()
@@ -214,6 +241,7 @@ def init_db():
             )
     conn.commit()
     return True
+
 
 try:
     init_db()
@@ -281,14 +309,62 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
 
 
 # ============================================================
-#               DASHBOARD (optimized single query)
+#               HELPER: PDF builder for tables
+# ============================================================
+
+def build_pdf_table(title, headers, rows, summary=None):
+    """Build a PDF with title and table. Returns base64."""
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(220, 38, 38)
+    pdf.cell(0, 10, "SHAHI TARDKA", ln=True, align="C")
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(100)
+    pdf.cell(0, 6, "Premium Spices & Foods", ln=True, align="C")
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(0)
+    pdf.cell(0, 8, title, ln=True, align="C")
+    pdf.ln(3)
+
+    # Table
+    col_w = 190 / len(headers)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(220, 38, 38)
+    pdf.set_text_color(255)
+    for h in headers:
+        pdf.cell(col_w, 8, str(h), 1, 0, "C", True)
+    pdf.ln()
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(0)
+    for r in rows:
+        for c in r:
+            pdf.cell(col_w, 7, str(c)[:30], 1, 0, "L")
+        pdf.ln()
+    pdf.ln(3)
+
+    if summary:
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_text_color(220, 38, 38)
+        for line in summary:
+            pdf.cell(0, 7, line, ln=True, align="R")
+
+    return base64.b64encode(bytes(pdf.output())).decode()
+
+
+def pdf_link(b64, filename, label="🖨️ Print / Download PDF"):
+    return f'<a href="data:application/pdf;base64,{b64}" download="{filename}" target="_blank" style="display:inline-block;background:linear-gradient(90deg,#dc2626,#b45309);color:#fff;padding:10px 20px;border-radius:10px;text-decoration:none;font-weight:600;margin-top:8px;">{label}</a>'
+
+
+# ============================================================
+#               DASHBOARD
 # ============================================================
 
 if menu == "📊 Dashboard":
     st.markdown("<h1 class='big-title'>Dashboard</h1>", unsafe_allow_html=True)
     st.caption("Real-time overview of your business")
 
-    # Ek hi query mein sab kuch
     summary = q("""
         SELECT
             (SELECT COALESCE(SUM(total),0) FROM sales) as sales,
@@ -355,6 +431,10 @@ elif menu == "🛒 Sale Entry":
     if "cart" not in st.session_state:
         st.session_state.cart = []
 
+    # Auto serial
+    if "auto_inv" not in st.session_state:
+        st.session_state.auto_inv = next_serial("INV", "sales", "invoice_no")
+
     col1, col2, col3 = st.columns(3)
     with col1:
         cust = st.selectbox("Customer", customers["name"].tolist())
@@ -362,7 +442,7 @@ elif menu == "🛒 Sale Entry":
     with col2:
         inv_date = st.date_input("Date", value=date.today())
     with col3:
-        inv_no = st.text_input("Invoice #", value=f"INV-{datetime.now().strftime('%y%m%d%H%M%S')}")
+        inv_no = st.text_input("Invoice #", value=st.session_state.auto_inv)
 
     st.markdown("### Add Items")
     c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
@@ -413,6 +493,7 @@ elif menu == "🛒 Sale Entry":
                     (str(inv_date), "cash_receipt", "customer", cust_id, paid, f"Sale {inv_no}"))
             st.success(f"✅ Saved: {inv_no}")
             st.session_state.cart = []
+            st.session_state.auto_inv = next_serial("INV", "sales", "invoice_no")
             st.rerun()
         if colB.button("🗑️ Clear Cart", use_container_width=True):
             st.session_state.cart = []
@@ -430,7 +511,7 @@ elif menu == "🛒 Sale Entry":
             pdf.set_text_color(0)
             pdf.set_font("Helvetica", "", 11)
             pdf.cell(0, 6, f"Invoice: {inv_no}", ln=True)
-            pdf.cell(0, 6, f"Date: {inv_date}", ln=True)
+            pdf.cell(0, 6, f"Date: {fmt_date(inv_date)}", ln=True)
             pdf.cell(0, 6, f"Customer: {cust}", ln=True)
             pdf.ln(3)
             pdf.set_font("Helvetica", "B", 10)
@@ -458,8 +539,7 @@ elif menu == "🛒 Sale Entry":
             pdf.cell(140, 7, "Paid:", 0, 0, "R"); pdf.cell(35, 7, f"{paid:.2f}", 0, 1, "R")
             pdf.cell(140, 7, "Balance:", 0, 0, "R"); pdf.cell(35, 7, f"{(total-paid):.2f}", 0, 1, "R")
             b64 = base64.b64encode(bytes(pdf.output())).decode()
-            href = f'<a href="data:application/pdf;base64,{b64}" download="{inv_no}.pdf" target="_blank">📄 Download/Print Invoice PDF</a>'
-            st.markdown(href, unsafe_allow_html=True)
+            st.markdown(pdf_link(b64, f"{inv_no}.pdf", "📄 Download / Print Invoice"), unsafe_allow_html=True)
 
 
 # ============================================================
@@ -469,7 +549,7 @@ elif menu == "🛒 Sale Entry":
 elif menu == "🛍️ Purchase Entry":
     st.markdown("<h1 class='big-title'>Purchase Entry</h1>", unsafe_allow_html=True)
     vendors = q("SELECT id, name FROM vendors ORDER BY name")
-    raws = q("SELECT id, name, rate FROM raw_materials ORDER BY name")
+    raws = q("SELECT id, name, rate, unit FROM raw_materials ORDER BY name")
 
     if len(vendors) == 0 or len(raws) == 0:
         st.warning("Pehle Vendors aur Raw Materials add karo")
@@ -478,6 +558,9 @@ elif menu == "🛍️ Purchase Entry":
     if "p_cart" not in st.session_state:
         st.session_state.p_cart = []
 
+    if "auto_bill" not in st.session_state:
+        st.session_state.auto_bill = next_serial("BILL", "purchases", "bill_no")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         v = st.selectbox("Vendor", vendors["name"].tolist())
@@ -485,7 +568,7 @@ elif menu == "🛍️ Purchase Entry":
     with c2:
         p_date = st.date_input("Date", value=date.today(), key="p_date")
     with c3:
-        bill_no = st.text_input("Bill #", value=f"BILL-{datetime.now().strftime('%y%m%d%H%M%S')}")
+        bill_no = st.text_input("Bill #", value=st.session_state.auto_bill)
 
     st.markdown("### Add Items")
     a, b, c, d = st.columns([3, 1, 1, 1])
@@ -502,6 +585,7 @@ elif menu == "🛍️ Purchase Entry":
             st.session_state.p_cart.append({
                 "raw_material_id": int(r_row["id"]), "name": rname,
                 "qty": pqty, "rate": prate, "amount": pqty * prate,
+                "unit": r_row["unit"] if "unit" in r_row else "kg",
             })
             st.rerun()
 
@@ -529,6 +613,7 @@ elif menu == "🛍️ Purchase Entry":
                     (str(p_date), "cash_payment", "vendor", v_id, paid_p, f"Purchase {bill_no}"))
             st.success(f"✅ Saved: {bill_no}")
             st.session_state.p_cart = []
+            st.session_state.auto_bill = next_serial("BILL", "purchases", "bill_no")
             st.rerun()
         if cB.button("🗑️ Clear", use_container_width=True):
             st.session_state.p_cart = []
@@ -551,6 +636,9 @@ elif menu == "↩️ Sale Return":
     if "r_cart" not in st.session_state:
         st.session_state.r_cart = []
 
+    if "auto_ret" not in st.session_state:
+        st.session_state.auto_ret = next_serial("RET", "sale_returns", "return_no")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         rc = st.selectbox("Customer", customers["name"].tolist())
@@ -558,7 +646,7 @@ elif menu == "↩️ Sale Return":
     with c2:
         r_date = st.date_input("Date", value=date.today(), key="r_date")
     with c3:
-        r_no = st.text_input("Return #", value=f"RET-{datetime.now().strftime('%y%m%d%H%M%S')}")
+        r_no = st.text_input("Return #", value=st.session_state.auto_ret)
 
     a, b, c, d = st.columns([3, 1, 1, 1])
     with a:
@@ -595,6 +683,7 @@ elif menu == "↩️ Sale Return":
                     (it["qty"], it["product_id"]))
             st.success(f"✅ Return saved: {r_no}")
             st.session_state.r_cart = []
+            st.session_state.auto_ret = next_serial("RET", "sale_returns", "return_no")
             st.rerun()
 
 
@@ -609,10 +698,11 @@ elif menu == "💰 Cash / Bank":
         c1, c2 = st.columns(2)
         with c1:
             t_date = st.date_input("Date", value=date.today())
-            t_type = st.selectbox("Type", ["cash_receipt", "cash_payment", "bank_receipt", "bank_payment"])
+            t_type = st.selectbox("Type", ["Cash Receipt", "Cash Payment", "Bank Receipt", "Bank Payment"])
+            t_type_db = t_type.lower().replace(" ", "_")
         with c2:
-            p_type = st.selectbox("Party Type", ["customer", "vendor"])
-            if p_type == "customer":
+            p_type = st.selectbox("Party Type", ["Customer", "Vendor"])
+            if p_type == "Customer":
                 parties = q("SELECT id, name FROM customers ORDER BY name")
             else:
                 parties = q("SELECT id, name FROM vendors ORDER BY name")
@@ -624,13 +714,15 @@ elif menu == "💰 Cash / Bank":
             p_id = int(parties[parties["name"] == p_name].iloc[0]["id"])
             run("""INSERT INTO transactions (date, type, party_type, party_id, amount, description)
                    VALUES (?,?,?,?,?,?)""",
-                (str(t_date), t_type, p_type, p_id, amount, desc))
+                (str(t_date), t_type_db, p_type.lower(), p_id, amount, desc))
             st.success("✅ Saved")
             st.rerun()
 
     st.markdown("### Recent Transactions")
     df = q("""SELECT date, type, party_type, party_id, amount, description
               FROM transactions ORDER BY id DESC LIMIT 50""")
+    if len(df):
+        df["date"] = df["date"].apply(fmt_date)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
@@ -731,6 +823,8 @@ elif menu == "🏭 Production":
     hist = q("""SELECT p.id, p.date, pr.name as product, p.qty_produced, p.wastage, p.notes
                 FROM production p LEFT JOIN products pr ON p.product_id = pr.id
                 ORDER BY p.id DESC LIMIT 30""")
+    if len(hist):
+        hist["date"] = hist["date"].apply(fmt_date)
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
 
@@ -758,53 +852,109 @@ elif menu == "🧾 Expenses":
 
     st.markdown("### Recent Expenses")
     df = q("SELECT * FROM expenses ORDER BY id DESC LIMIT 50")
+    if len(df):
+        df["date"] = df["date"].apply(fmt_date)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # ============================================================
-#               LEDGER
+#               LEDGER (Updated: date range + print)
 # ============================================================
 
 elif menu == "📒 Ledger":
     st.markdown("<h1 class='big-title'>Customer & Vendor Ledger</h1>", unsafe_allow_html=True)
-    ltype = st.radio("Select", ["Customer", "Vendor"], horizontal=True)
+
+    c1, c2, c3 = st.columns([1, 2, 2])
+    with c1:
+        ltype = st.radio("Select", ["Customer", "Vendor"], horizontal=False)
     if ltype == "Customer":
         parties = q("SELECT id, name, opening_balance FROM customers ORDER BY name")
-        table_sales, field, party_type = "sales", "customer_id", "customer"
+        party_type = "customer"
     else:
         parties = q("SELECT id, name, opening_balance FROM vendors ORDER BY name")
-        table_sales, field, party_type = "purchases", "vendor_id", "vendor"
+        party_type = "vendor"
 
     if len(parties) == 0:
         st.info(f"No {ltype}s added yet")
         st.stop()
 
-    p_name = st.selectbox(f"{ltype}", parties["name"].tolist())
-    p_row = parties[parties["name"] == p_name].iloc[0]
-    p_id = int(p_row["id"])
+    with c2:
+        p_name = st.selectbox(f"{ltype}", parties["name"].tolist())
+        p_row = parties[parties["name"] == p_name].iloc[0]
+        p_id = int(p_row["id"])
+    with c3:
+        date_from = st.date_input("From Date", value=date.today().replace(day=1))
+        date_to = st.date_input("To Date", value=date.today())
+
     opening = float(p_row["opening_balance"] or 0)
+    d_from = fmt_date(date_from)
+    d_to = fmt_date(date_to)
 
-    totals = q(f"""
-        SELECT
-            (SELECT COALESCE(SUM(total),0) FROM {table_sales} WHERE {field} = ?) as business,
-            (SELECT COALESCE(SUM(amount),0) FROM transactions
-                WHERE party_type = ? AND party_id = ?) as paid
-    """, (p_id, party_type, p_id))
-    total_debit = totals.iloc[0]["business"]
-    total_paid = totals.iloc[0]["paid"]
-    balance = opening + total_debit - total_paid
+    # Convert to ISO for SQL comparison if dates stored as YYYY-MM-DD
+    iso_from = date_from.strftime("%Y-%m-%d")
+    iso_to = date_to.strftime("%Y-%m-%d")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Opening", f"Rs. {opening:,.0f}")
-    c2.metric("Total Business", f"Rs. {total_debit:,.0f}")
-    c3.metric("Total Paid", f"Rs. {total_paid:,.0f}")
-    c4.metric("Balance", f"Rs. {balance:,.0f}")
+    txn = q("""SELECT date, type, amount, description
+               FROM transactions
+               WHERE party_type = ? AND party_id = ?
+                 AND date BETWEEN ? AND ?
+               ORDER BY date""", (party_type, p_id, iso_from, iso_to))
+
+    total_debit = 0
+    total_paid = 0
+    rows = []
+    balance = opening
+    for _, r in txn.iterrows():
+        amt = float(r["amount"] or 0)
+        is_payment = "payment" in str(r["type"]).lower()
+        if is_payment:
+            balance -= amt
+            total_paid += amt
+            debit = 0
+            credit = amt
+        else:
+            balance += amt
+            total_debit += amt
+            debit = amt
+            credit = 0
+        rows.append([
+            fmt_date(r["date"]),
+            str(r["type"]).replace("_", " ").title(),
+            f"{debit:.2f}" if debit else "",
+            f"{credit:.2f}" if credit else "",
+            f"{balance:.2f}",
+            str(r["description"] or ""),
+        ])
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Opening Balance", f"Rs. {opening:,.0f}")
+    m2.metric("Total Debit", f"Rs. {total_debit:,.0f}")
+    m3.metric("Total Credit", f"Rs. {total_paid:,.0f}")
+    m4.metric("Closing Balance", f"Rs. {balance:,.0f}")
 
     st.markdown("### Transactions")
-    df = q("""SELECT date, type, amount, description FROM transactions
-              WHERE party_type = ? AND party_id = ?
-              ORDER BY date DESC""", (party_type, p_id))
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    if rows:
+        st.dataframe(
+            pd.DataFrame(rows, columns=["Date", "Type", "Debit", "Credit", "Balance", "Description"]),
+            use_container_width=True, hide_index=True
+        )
+    else:
+        st.info("No transactions in this date range")
+
+    # Print button
+    if st.button("🖨️ Print Ledger"):
+        b64 = build_pdf_table(
+            f"{ltype} Ledger: {p_name} ({d_from} to {d_to})",
+            ["Date", "Type", "Debit", "Credit", "Balance", "Description"],
+            rows,
+            [
+                f"Opening Balance: Rs. {opening:,.2f}",
+                f"Total Debit: Rs. {total_debit:,.2f}",
+                f"Total Credit: Rs. {total_paid:,.2f}",
+                f"Closing Balance: Rs. {balance:,.2f}",
+            ]
+        )
+        st.markdown(pdf_link(b64, f"Ledger_{p_name}_{d_from}_{d_to}.pdf"), unsafe_allow_html=True)
 
 
 # ============================================================
@@ -819,19 +969,25 @@ elif menu == "📈 Reports":
         d1 = st.date_input("From", value=date.today().replace(day=1), key="s_from")
         d2 = st.date_input("To", value=date.today(), key="s_to")
         df = q("SELECT * FROM sales WHERE date BETWEEN ? AND ? ORDER BY date DESC",
-               (str(d1), str(d2)))
+               (d1.strftime("%Y-%m-%d"), d2.strftime("%Y-%m-%d")))
+        if len(df):
+            df["date"] = df["date"].apply(fmt_date)
         st.dataframe(df, use_container_width=True, hide_index=True)
         if len(df):
             st.metric("Total Sales", f"Rs. {df['total'].sum():,.0f}")
 
     with tab2:
         df = q("SELECT * FROM purchases ORDER BY date DESC LIMIT 100")
+        if len(df):
+            df["date"] = df["date"].apply(fmt_date)
         st.dataframe(df, use_container_width=True, hide_index=True)
         if len(df):
             st.metric("Total Purchases", f"Rs. {df['total'].sum():,.0f}")
 
     with tab3:
         df = q("SELECT * FROM expenses ORDER BY date DESC LIMIT 100")
+        if len(df):
+            df["date"] = df["date"].apply(fmt_date)
         st.dataframe(df, use_container_width=True, hide_index=True)
         if len(df):
             st.metric("Total Expenses", f"Rs. {df['amount'].sum():,.0f}")
@@ -875,7 +1031,7 @@ elif menu == "🍽️ Products":
                 n = st.text_input("Name")
                 sku = st.text_input("SKU")
             with c2:
-                unit = st.selectbox("Unit", ["pcs", "kg", "g", "box", "packet"])
+                unit = st.selectbox("Unit", ["Pcs", "Kg", "G", "Box", "Packet", "Ton"])
                 sp = st.number_input("Sale Price", min_value=0.0, value=0.0)
             with c3:
                 cp = st.number_input("Cost Price", min_value=0.0, value=0.0)
@@ -899,7 +1055,7 @@ elif menu == "🍽️ Products":
                 nn = st.text_input("Name", value=row["name"])
                 nsku = st.text_input("SKU", value=row["sku"] or "")
             with c2:
-                nun = st.text_input("Unit", value=row["unit"] or "pcs")
+                nun = st.text_input("Unit", value=row["unit"] or "Pcs")
                 nsp = st.number_input("Sale Price", value=float(row["sale_price"]))
             with c3:
                 ncp = st.number_input("Cost Price", value=float(row["cost_price"]))
@@ -917,29 +1073,35 @@ elif menu == "🍽️ Products":
 
 
 # ============================================================
-#               RAW MATERIALS
+#               RAW MATERIALS (Updated: weight + unit)
 # ============================================================
 
 elif menu == "🧂 Raw Materials":
     st.markdown("<h1 class='big-title'>Raw Materials</h1>", unsafe_allow_html=True)
+    st.caption("Raw material ke saath uska weight aur unit likho — jaise 1000 kg, 500 g, 5 ton")
 
     with st.form("add_rm"):
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             n = st.text_input("Name")
         with c2:
-            unit = st.selectbox("Unit", ["kg", "g", "liter", "pcs"])
+            unit_options = ["Kg", "G", "Ton", "Liter", "Ml", "Pcs", "Packet", "Box"]
+            unit = st.selectbox("Unit", unit_options)
         with c3:
-            rate = st.number_input("Rate", min_value=0.0, value=0.0)
+            rate = st.number_input("Rate (per unit)", min_value=0.0, value=0.0)
         with c4:
-            stock = st.number_input("Opening Stock", min_value=0.0, value=0.0)
+            stock = st.number_input("Opening Stock / Weight", min_value=0.0, value=0.0,
+                                    help="Jaise 1000 likho — matlab 1000 kg")
         if st.form_submit_button("Add Raw Material") and n:
             run("INSERT INTO raw_materials (name, unit, rate, stock_qty) VALUES (?,?,?,?)",
                 (n, unit, rate, stock))
-            st.success("✅ Added")
+            st.success(f"✅ Added: {n} ({stock} {unit})")
             st.rerun()
 
     df = q("SELECT * FROM raw_materials ORDER BY name")
+    if len(df):
+        # Display weight column "1000 Kg" style
+        df["Weight"] = df.apply(lambda r: f"{r['stock_qty']:g} {r['unit']}", axis=1)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.markdown("### ✏️ Edit / Delete")
@@ -953,7 +1115,7 @@ elif menu == "🧂 Raw Materials":
                 nun = st.text_input("Unit", value=row["unit"])
             with c2:
                 nrate = st.number_input("Rate", value=float(row["rate"]))
-                nstock = st.number_input("Stock", value=float(row["stock_qty"]))
+                nstock = st.number_input("Weight / Stock", value=float(row["stock_qty"]))
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
                 run("UPDATE raw_materials SET name=?, unit=?, rate=?, stock_qty=? WHERE id=?",
@@ -1005,7 +1167,7 @@ elif menu == "👥 Customers":
             with c3:
                 nad = st.text_input("Address", value=row["address"] or "")
             with c4:
-                nob = st.number_input("Opening Bal", value=float(row["opening_balance"] or 0))
+                nob = st.number_input("Opening Balance", value=float(row["opening_balance"] or 0))
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
                 run("UPDATE customers SET name=?, phone=?, address=?, opening_balance=? WHERE id=?",
@@ -1057,7 +1219,7 @@ elif menu == "🚚 Vendors":
             with c3:
                 nad = st.text_input("Address", value=row["address"] or "")
             with c4:
-                nob = st.number_input("Opening Bal", value=float(row["opening_balance"] or 0))
+                nob = st.number_input("Opening Balance", value=float(row["opening_balance"] or 0))
             cc1, cc2 = st.columns(2)
             if cc1.form_submit_button("💾 Update"):
                 run("UPDATE vendors SET name=?, phone=?, address=?, opening_balance=? WHERE id=?",
