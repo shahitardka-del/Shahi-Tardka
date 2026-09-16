@@ -4,7 +4,6 @@ import pandas as pd
 import bcrypt
 import plotly.express as px
 from datetime import datetime, date
-from fpdf import FPDF
 import base64
 import re
 import streamlit.components.v1 as components
@@ -82,12 +81,20 @@ def title_case(s):
     return str(s).title()
 
 
+def safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
 # ============================================================
-#               DATABASE
+#               DATABASE (FIXED)
 # ============================================================
 
 @st.cache_resource
 def get_db():
+    """Single DB connection - cached resource."""
     return libsql.connect(
         st.secrets["TURSO_URL"],
         auth_token=st.secrets["TURSO_TOKEN"]
@@ -95,6 +102,7 @@ def get_db():
 
 
 def run(sql, args=()):
+    """Write operation - clears data cache."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
@@ -105,16 +113,13 @@ def run(sql, args=()):
 
 @st.cache_data(ttl=120, show_spinner=False, max_entries=80)
 def q(sql, args=()):
+    """Cached read query."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
     cols = [d[0] for d in cur.description] if cur.description else []
     return pd.DataFrame(cur.fetchall(), columns=cols)
 
-
-# ============================================================
-#               SHORT SERIAL
-# ============================================================
 
 def next_serial(prefix, table, column):
     try:
@@ -136,10 +141,9 @@ def next_serial(prefix, table, column):
 
 
 # ============================================================
-#               DB INIT
+#               DB INIT (NO CACHE - run every time)
 # ============================================================
 
-@st.cache_resource
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -174,6 +178,7 @@ def init_db():
         name TEXT NOT NULL, sku TEXT, unit TEXT DEFAULT 'Pcs',
         sale_price REAL DEFAULT 0, cost_price REAL DEFAULT 0,
         stock_qty REAL DEFAULT 0,
+        weight REAL DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS product_price_history (
@@ -202,6 +207,8 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         sale_id INTEGER, product_id INTEGER,
         product_name TEXT, qty REAL NOT NULL,
+        unit TEXT DEFAULT 'Pcs',
+        weight REAL DEFAULT 0,
         rate REAL NOT NULL, amount REAL NOT NULL
     );
     CREATE TABLE IF NOT EXISTS purchases (
@@ -261,18 +268,25 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date);
     CREATE INDEX IF NOT EXISTS idx_purchases_vendor ON purchases(vendor_id);
     CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
-    CREATE INDEX IF NOT EXISTS idx_prod_price_history ON product_price_history(product_id);
-    CREATE INDEX IF NOT EXISTS idx_rm_price_history ON raw_material_price_history(raw_material_id);
     """
     for stmt in schema.split(";"):
         s = stmt.strip()
         if s:
             cur.execute(s)
 
-    for tbl, col in [("sale_items", "product_name"), ("purchase_items", "raw_name"),
-                     ("sale_return_items", "product_name"), ("production_materials", "raw_name")]:
+    # Migrations - add columns if missing
+    migrations = [
+        ("sale_items", "product_name", "TEXT"),
+        ("sale_items", "unit", "TEXT DEFAULT 'Pcs'"),
+        ("sale_items", "weight", "REAL DEFAULT 0"),
+        ("purchase_items", "raw_name", "TEXT"),
+        ("sale_return_items", "product_name", "TEXT"),
+        ("production_materials", "raw_name", "TEXT"),
+        ("products", "weight", "REAL DEFAULT 0"),
+    ]
+    for tbl, col, typ in migrations:
         try:
-            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} TEXT")
+            cur.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}")
         except Exception:
             pass
 
@@ -297,7 +311,6 @@ def init_db():
                 (name, price, cost, stock, "Pcs"),
             )
     conn.commit()
-    return True
 
 
 try:
@@ -326,12 +339,15 @@ def login_page():
             p = st.text_input("Password", type="password")
             ok = st.form_submit_button("Sign In", use_container_width=True)
             if ok:
-                df = q("SELECT * FROM users WHERE username = ?", (u,))
-                if len(df) and bcrypt.checkpw(p.encode(), df.iloc[0]["password_hash"].encode()):
-                    st.session_state.user = {"id": int(df.iloc[0]["id"]), "username": u}
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password")
+                try:
+                    df = q("SELECT * FROM users WHERE username = ?", (u,))
+                    if len(df) and bcrypt.checkpw(p.encode(), df.iloc[0]["password_hash"].encode()):
+                        st.session_state.user = {"id": int(df.iloc[0]["id"]), "username": u}
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password")
+                except Exception as e:
+                    st.error(f"Login error: {e}")
 
 
 if not st.session_state.user:
@@ -355,8 +371,7 @@ def esc(s):
 def html_table(headers, rows, summary=None, title="", extra_header=None):
     h = """
     <!DOCTYPE html>
-    <html><head><meta charset="utf-8">
-    <title>Print</title>
+    <html><head><meta charset="utf-8"><title>Print</title>
     <style>
         * { box-sizing: border-box; }
         body { font-family: Arial, Helvetica, sans-serif; padding: 20px; color: #000; }
@@ -371,16 +386,9 @@ def html_table(headers, rows, summary=None, title="", extra_header=None):
         tr:nth-child(even) td { background: #fef2f2; }
         .summary { text-align: right; margin-top: 14px; font-weight: bold; font-size: 13px; }
         .summary div { margin: 3px 0; }
-        @media print {
-            @page { margin: 12mm; }
-            body { padding: 0; }
-        }
-    </style>
-    </head><body>
-    <div class="header">
-        <h1>SHAHI TARDKA</h1>
-        <p>Premium Spices &amp; Foods</p>
-    </div>
+        @media print { @page { margin: 12mm; } body { padding: 0; } }
+    </style></head><body>
+    <div class="header"><h1>SHAHI TARDKA</h1><p>Premium Spices &amp; Foods</p></div>
     """
     if title:
         h += f'<div class="title">{esc(title)}</div>'
@@ -389,7 +397,6 @@ def html_table(headers, rows, summary=None, title="", extra_header=None):
         for line in extra_header:
             h += f"{esc(line)}<br>"
         h += "</div>"
-
     if headers:
         h += "<table><thead><tr>"
         for x in headers:
@@ -401,19 +408,13 @@ def html_table(headers, rows, summary=None, title="", extra_header=None):
                 h += f"<td>{esc(c)}</td>"
             h += "</tr>"
         h += "</tbody></table>"
-
     if summary:
         h += '<div class="summary">'
         for line in summary:
             h += f"<div>{esc(line)}</div>"
         h += "</div>"
-
     h += """
-    <script>
-        window.onload = function() {
-            setTimeout(function() { window.print(); }, 300);
-        };
-    </script>
+    <script>window.onload = function() { setTimeout(function() { window.print(); }, 300); };</script>
     </body></html>
     """
     return h
@@ -424,43 +425,26 @@ def direct_print(html_str, height=1):
 
 
 # ============================================================
-#               LEDGER ITEM HELPER (Naya Function)
+#               LEDGER ITEM HELPER
 # ============================================================
 
-def get_items_for_txn(party_type, party_id, date_str, description):
-    """
-    Transaction ke description se related items nikaalo.
-    - 'Sale INV-5' -> sale_items se product names
-    - 'Purchase BILL-3' -> purchase_items se raw names
-    """
+def get_items_for_txn(party_type, description):
     try:
         desc = str(description or "")
-
-        # Sale receipt: 'Sale INV-5'
         if party_type == "customer" and desc.startswith("Sale "):
             inv_no = desc.replace("Sale ", "").strip()
-            df = q("""SELECT si.product_name, si.qty, si.rate, si.amount
-                      FROM sale_items si
-                      JOIN sales s ON si.sale_id = s.id
+            df = q("""SELECT si.product_name, si.qty, si.rate
+                      FROM sale_items si JOIN sales s ON si.sale_id = s.id
                       WHERE s.invoice_no = ?""", (inv_no,))
             if len(df):
-                parts = []
-                for _, r in df.iterrows():
-                    parts.append(f"{r['product_name']} ({r['qty']:g} x Rs.{r['rate']:g})")
-                return " + ".join(parts)
-
-        # Purchase payment: 'Purchase BILL-3'
+                return " + ".join([f"{r['product_name']} ({r['qty']:g} x Rs.{r['rate']:g})" for _, r in df.iterrows()])
         if party_type == "vendor" and desc.startswith("Purchase "):
             bill_no = desc.replace("Purchase ", "").strip()
             df = q("""SELECT pi.raw_name, pi.qty, pi.rate
-                      FROM purchase_items pi
-                      JOIN purchases p ON pi.purchase_id = p.id
+                      FROM purchase_items pi JOIN purchases p ON pi.purchase_id = p.id
                       WHERE p.bill_no = ?""", (bill_no,))
             if len(df):
-                parts = []
-                for _, r in df.iterrows():
-                    parts.append(f"{r['raw_name']} ({r['qty']:g} x Rs.{r['rate']:g})")
-                return " + ".join(parts)
+                return " + ".join([f"{r['raw_name']} ({r['qty']:g} x Rs.{r['rate']:g})" for _, r in df.iterrows()])
     except Exception:
         pass
     return str(description or "")
@@ -520,8 +504,7 @@ if menu == "📊 Dashboard":
 
     with col1:
         d = q("""SELECT date, SUM(total) as total FROM sales
-                 WHERE date >= date('now','-14 days')
-                 GROUP BY date ORDER BY date""")
+                 WHERE date >= date('now','-14 days') GROUP BY date ORDER BY date""")
         if len(d):
             d["date_display"] = d["date"].apply(fmt_date)
             fig = px.area(d, x="date_display", y="total", title="Last 14 Days Sales",
@@ -549,14 +532,14 @@ if menu == "📊 Dashboard":
 
 
 # ============================================================
-#               SALE ENTRY
+#               SALE ENTRY (with Unit Pcs/Kg + Weight)
 # ============================================================
 
 elif menu == "🛒 Sale Entry":
     st.markdown("<h1 class='big-title'>Sale Entry</h1>", unsafe_allow_html=True)
 
     customers = q("SELECT id, name FROM customers ORDER BY name")
-    products = q("SELECT id, name, sale_price, stock_qty FROM products ORDER BY name")
+    products = q("SELECT id, name, sale_price, stock_qty, unit FROM products ORDER BY name")
 
     if len(customers) == 0 or len(products) == 0:
         st.warning("Pehle Customers Aur Products Add Karo")
@@ -578,20 +561,26 @@ elif menu == "🛒 Sale Entry":
         inv_no = st.text_input("Invoice #", value=st.session_state.auto_inv)
 
     st.markdown("### Add Items")
-    c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+    c1, c2, c3, c4, c5, c6 = st.columns([3, 1, 1, 1, 1, 1])
     with c1:
         prod = st.selectbox("Product", products["name"].tolist(), key="sale_prod")
         p_row = products[products["name"] == prod].iloc[0]
     with c2:
         qty = st.number_input("Qty", min_value=0.01, value=1.0, step=1.0, key="sale_qty")
     with c3:
-        rate = st.number_input("Rate", min_value=0.0, value=float(p_row["sale_price"]), key="sale_rate")
+        unit = st.selectbox("Unit", ["Pcs", "Kg", "G", "Box", "Packet", "Ton"], key="sale_unit")
     with c4:
+        weight = st.number_input("Weight", min_value=0.0, value=0.0, step=0.1, key="sale_weight",
+                                 help="Agar Kg mein bech rahe ho to weight likho (jaise 2.5)")
+    with c5:
+        rate = st.number_input("Rate", min_value=0.0, value=float(p_row["sale_price"]), key="sale_rate")
+    with c6:
         st.write(""); st.write("")
         if st.button("➕ Add"):
             st.session_state.cart.append({
                 "product_id": int(p_row["id"]), "name": prod,
-                "qty": qty, "rate": rate, "amount": qty * rate,
+                "qty": qty, "unit": unit, "weight": weight,
+                "rate": rate, "amount": qty * rate,
             })
             st.rerun()
 
@@ -616,9 +605,9 @@ elif menu == "🛒 Sale Entry":
             )
             sale_id = cur.lastrowid
             for it in st.session_state.cart:
-                run("""INSERT INTO sale_items (sale_id, product_id, product_name, qty, rate, amount)
-                       VALUES (?,?,?,?,?,?)""",
-                    (sale_id, it["product_id"], it["name"], it["qty"], it["rate"], it["amount"]))
+                run("""INSERT INTO sale_items (sale_id, product_id, product_name, qty, unit, weight, rate, amount)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (sale_id, it["product_id"], it["name"], it["qty"], it["unit"], it["weight"], it["rate"], it["amount"]))
                 run("UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
                     (it["qty"], it["product_id"]))
             if paid > 0:
@@ -632,13 +621,16 @@ elif menu == "🛒 Sale Entry":
         if colB.button("🗑️ Clear Cart", use_container_width=True):
             st.session_state.cart = []
             st.rerun()
-
         if colC.button("🖨️ Print Invoice", use_container_width=True):
             rows = []
             for i, it in enumerate(st.session_state.cart, 1):
-                rows.append([i, it["name"], f"{it['qty']:g}", f"{it['rate']:.2f}", f"{it['amount']:.2f}"])
+                item_disp = f"{it['name']} ({it['qty']:g} {it['unit']}"
+                if it.get("weight"):
+                    item_disp += f", {it['weight']:g} kg"
+                item_disp += ")"
+                rows.append([i, item_disp, f"{it['rate']:.2f}", f"{it['amount']:.2f}"])
             html_str = html_table(
-                ["#", "Item", "Qty", "Rate", "Amount"],
+                ["#", "Item", "Rate", "Amount"],
                 rows,
                 summary=[
                     f"Subtotal: Rs. {subtotal:,.2f}",
@@ -648,10 +640,7 @@ elif menu == "🛒 Sale Entry":
                     f"Balance: Rs. {(total-paid):,.2f}",
                 ],
                 title=f"Invoice: {inv_no}",
-                extra_header=[
-                    f"Date: {fmt_date(inv_date)}",
-                    f"Customer: {title_case(cust)}",
-                ],
+                extra_header=[f"Date: {fmt_date(inv_date)}", f"Customer: {title_case(cust)}"],
             )
             direct_print(html_str)
             st.success("✅ Print dialog khul gaya — printer select karein")
@@ -1004,7 +993,7 @@ elif menu == "🧾 Expenses":
 
 
 # ============================================================
-#               LEDGER  (UPDATED - Item Names in Type Column)
+#               LEDGER
 # ============================================================
 
 elif menu == "📒 Ledger":
@@ -1062,13 +1051,8 @@ elif menu == "📒 Ledger":
             else:
                 balance -= amt; total_debit += amt; dr, cr = amt, 0
 
-        # Transaction type label
         type_label = title_case(str(r["type"]).replace("_", " "))
-
-        # Get items for this transaction (SAAL ka main change)
-        items_detail = get_items_for_txn(party_type, p_id, r["date"], r["description"])
-
-        # Show type with item names
+        items_detail = get_items_for_txn(party_type, r["description"])
         if items_detail and items_detail != str(r["description"] or ""):
             type_display = f"{type_label}: {items_detail}"
         else:
