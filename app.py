@@ -5,10 +5,11 @@ import bcrypt
 import plotly.express as px
 from datetime import datetime, date
 from fpdf import FPDF
-import io
 import base64
 
-# ---------------- PAGE CONFIG ----------------
+# ============================================================
+#               PAGE CONFIG (must be first)
+# ============================================================
 st.set_page_config(
     page_title="Shahi Tardka - Business Manager",
     page_icon="🌶️",
@@ -16,34 +17,24 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------- CUSTOM CSS (Creative Theme) ----------------
+# ============================================================
+#               CUSTOM CSS (Creative Theme)
+# ============================================================
 st.markdown("""
 <style>
-    .stApp {
-        background: linear-gradient(135deg, #fef2f2 0%, #fff7ed 50%, #fffbeb 100%);
-    }
+    .stApp { background: linear-gradient(135deg, #fef2f2 0%, #fff7ed 50%, #fffbeb 100%); }
     section[data-testid="stSidebar"] {
         background: linear-gradient(180deg, #b91c1c 0%, #7f1d1d 60%, #78350f 100%);
     }
     section[data-testid="stSidebar"] * { color: #fff !important; }
     section[data-testid="stSidebar"] .stRadio label { color: #fff !important; }
     h1, h2, h3 { color: #7f1d1d !important; font-weight: 800 !important; }
-    .metric-card {
-        background: #fff;
-        padding: 20px;
-        border-radius: 16px;
-        box-shadow: 0 4px 20px rgba(185,28,28,0.08);
-        border-left: 5px solid #dc2626;
-    }
     .stButton>button {
         background: linear-gradient(90deg, #dc2626, #b45309) !important;
-        color: white !important;
-        border: none !important;
-        border-radius: 10px !important;
-        font-weight: 600 !important;
+        color: white !important; border: none !important;
+        border-radius: 10px !important; font-weight: 600 !important;
         padding: 8px 20px !important;
     }
-    .stButton>button:hover { opacity: 0.9; }
     div[data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
     .block-container { padding-top: 2rem; }
     .big-title {
@@ -55,29 +46,48 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- DB CONNECTION ----------------
+
+# ============================================================
+#               DATABASE LAYER (MAX OPTIMIZED)
+# ============================================================
+
 @st.cache_resource
 def get_db():
-    url = st.secrets["TURSO_URL"]
-    token = st.secrets["TURSO_TOKEN"]
-    return libsql.connect(url, auth_token=token)
+    """DB connection - single instance, cached forever."""
+    return libsql.connect(
+        st.secrets["TURSO_URL"],
+        auth_token=st.secrets["TURSO_TOKEN"]
+    )
+
 
 def run(sql, args=()):
+    """INSERT/UPDATE/DELETE - clears read cache after write."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
     conn.commit()
+    # Sirf relevant cache clear karo, poori cache nahi
+    q.clear()
     return cur
 
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=100)
 def q(sql, args=()):
+    """SELECT queries - cached 10 min. Ye speed ka asal raaz hai."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(sql, args)
     cols = [d[0] for d in cur.description] if cur.description else []
     return pd.DataFrame(cur.fetchall(), columns=cols)
 
-# ---------------- INIT DB ----------------
+
+# ============================================================
+#               DB INITIALIZATION (runs once per session)
+# ============================================================
+
+@st.cache_resource
 def init_db():
+    """Schema create + seed - sirf ek baar chalta hai."""
     conn = get_db()
     cur = conn.cursor()
     schema = """
@@ -172,56 +182,53 @@ def init_db():
         amount REAL NOT NULL, description TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(date);
+    CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
+    CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
+    CREATE INDEX IF NOT EXISTS idx_transactions_party ON transactions(party_type, party_id);
+    CREATE INDEX IF NOT EXISTS idx_purchases_vendor ON purchases(vendor_id);
+    CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase ON purchase_items(purchase_id);
     """
     for stmt in schema.split(";"):
         s = stmt.strip()
         if s:
             cur.execute(s)
-    # default admin
     cur.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
         pw = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
         cur.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", ("admin", pw))
-    conn.commit()
-
-try:
-    init_db()
-except Exception as e:
-    st.error(f"DB init error: {e}")
-
-# ---------------- SEED PRODUCTS (once) ----------------
-def seed_products():
-    conn = get_db()
-    cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM products")
     if cur.fetchone()[0] == 0:
         items = [
-            ("Chili Powder 250 g", 250, 0, 250),
-            ("Chili Powder 100 g", 100, 0, 100),
-            ("Chili Flakes 250 g", 250, 0, 250),
-            ("Chili Flakes 100 g", 100, 0, 100),
-            ("Turmeric Powder 250 g", 250, 0, 250),
-            ("Turmeric Powder 100 g", 100, 0, 100),
-            ("Chili 20 Rs.", 20, 0, 20),
-            ("Chili 10 Rs.", 10, 0, 10),
-            ("Turmeric 20 Rs.", 20, 0, 20),
-            ("Turmeric 10 Rs.", 10, 0, 10),
-            ("Whole Coriander", 1, 0, 0),
-            ("Other Spices", 1, 0, 0),
+            ("Chili Powder 250 g", 250, 0, 250), ("Chili Powder 100 g", 100, 0, 100),
+            ("Chili Flakes 250 g", 250, 0, 250), ("Chili Flakes 100 g", 100, 0, 100),
+            ("Turmeric Powder 250 g", 250, 0, 250), ("Turmeric Powder 100 g", 100, 0, 100),
+            ("Chili 20 Rs.", 20, 0, 20), ("Chili 10 Rs.", 10, 0, 10),
+            ("Turmeric 20 Rs.", 20, 0, 20), ("Turmeric 10 Rs.", 10, 0, 10),
+            ("Whole Coriander", 1, 0, 0), ("Other Spices", 1, 0, 0),
         ]
         for name, price, cost, stock in items:
             cur.execute(
                 "INSERT INTO products (name, sale_price, cost_price, stock_qty, unit) VALUES (?,?,?,?,?)",
                 (name, price, cost, stock, "pcs"),
             )
-        conn.commit()
-seed_products()
+    conn.commit()
+    return True
 
-# ---------------- SESSION ----------------
+try:
+    init_db()
+except Exception as e:
+    st.error(f"DB init error: {e}")
+
+
+# ============================================================
+#               LOGIN
+# ============================================================
+
 if "user" not in st.session_state:
     st.session_state.user = None
 
-# ---------------- LOGIN ----------------
+
 def login_page():
     col1, col2, col3 = st.columns([1, 1.2, 1])
     with col2:
@@ -241,13 +248,18 @@ def login_page():
                 else:
                     st.error("Invalid username or password")
 
+
 if not st.session_state.user:
     login_page()
     st.stop()
 
 user = st.session_state.user
 
-# ---------------- SIDEBAR NAV ----------------
+
+# ============================================================
+#               SIDEBAR
+# ============================================================
+
 st.sidebar.markdown("<h2 style='text-align:center'>🌶️ Shahi Tardka</h2>", unsafe_allow_html=True)
 st.sidebar.markdown(f"<p style='text-align:center;font-size:0.85rem'>👤 {user['username']}</p>", unsafe_allow_html=True)
 st.sidebar.markdown("---")
@@ -255,22 +267,10 @@ st.sidebar.markdown("---")
 menu = st.sidebar.radio(
     "Menu",
     [
-        "📊 Dashboard",
-        "🛒 Sale Entry",
-        "🛍️ Purchase Entry",
-        "↩️ Sale Return",
-        "💰 Cash / Bank",
-        "📦 Stock Report",
-        "🏭 Production",
-        "🧾 Expenses",
-        "📒 Ledger",
-        "📈 Reports",
-        "🍽️ Products",
-        "🧂 Raw Materials",
-        "👥 Customers",
-        "🚚 Vendors",
-        "⚙️ Master Setup",
-        "💾 Backup / Restore",
+        "📊 Dashboard", "🛒 Sale Entry", "🛍️ Purchase Entry", "↩️ Sale Return",
+        "💰 Cash / Bank", "📦 Stock Report", "🏭 Production", "🧾 Expenses",
+        "📒 Ledger", "📈 Reports", "🍽️ Products", "🧂 Raw Materials",
+        "👥 Customers", "🚚 Vendors", "⚙️ Master Setup", "💾 Backup / Restore",
     ],
     label_visibility="collapsed",
 )
@@ -279,18 +279,25 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
     st.session_state.user = None
     st.rerun()
 
+
 # ============================================================
-#                       PAGES
+#               DASHBOARD (optimized single query)
 # ============================================================
 
-# ---------- DASHBOARD ----------
 if menu == "📊 Dashboard":
     st.markdown("<h1 class='big-title'>Dashboard</h1>", unsafe_allow_html=True)
     st.caption("Real-time overview of your business")
 
-    s = q("SELECT COALESCE(SUM(total),0) t FROM sales").iloc[0]["t"]
-    p = q("SELECT COALESCE(SUM(total),0) t FROM purchases").iloc[0]["t"]
-    e = q("SELECT COALESCE(SUM(amount),0) t FROM expenses").iloc[0]["t"]
+    # Ek hi query mein sab kuch
+    summary = q("""
+        SELECT
+            (SELECT COALESCE(SUM(total),0) FROM sales) as sales,
+            (SELECT COALESCE(SUM(total),0) FROM purchases) as purchases,
+            (SELECT COALESCE(SUM(amount),0) FROM expenses) as expenses
+    """)
+    s = summary.iloc[0]["sales"]
+    p = summary.iloc[0]["purchases"]
+    e = summary.iloc[0]["expenses"]
     profit = s - p - e
 
     c1, c2, c3, c4 = st.columns(4)
@@ -309,7 +316,7 @@ if menu == "📊 Dashboard":
         if len(d):
             fig = px.area(d, x="date", y="total", title="Last 14 Days Sales",
                           color_discrete_sequence=["#dc2626"])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
             st.info("No sales yet")
 
@@ -319,7 +326,7 @@ if menu == "📊 Dashboard":
         if len(m):
             fig = px.bar(m.iloc[::-1], x="month", y="total", title="Monthly Sales",
                          color_discrete_sequence=["#b45309"])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
         else:
             st.info("No sales yet")
 
@@ -330,7 +337,11 @@ if menu == "📊 Dashboard":
     else:
         st.success("All products sufficiently stocked ✅")
 
-# ---------- SALE ENTRY ----------
+
+# ============================================================
+#               SALE ENTRY
+# ============================================================
+
 elif menu == "🛒 Sale Entry":
     st.markdown("<h1 class='big-title'>Sale Entry</h1>", unsafe_allow_html=True)
 
@@ -363,18 +374,16 @@ elif menu == "🛒 Sale Entry":
     with c3:
         rate = st.number_input("Rate", min_value=0.0, value=float(p_row["sale_price"]), key="sale_rate")
     with c4:
-        st.write("")
-        st.write("")
+        st.write(""); st.write("")
         if st.button("➕ Add"):
             st.session_state.cart.append({
-                "product_id": int(p_row["id"]),
-                "name": prod, "qty": qty, "rate": rate, "amount": qty * rate,
+                "product_id": int(p_row["id"]), "name": prod,
+                "qty": qty, "rate": rate, "amount": qty * rate,
             })
             st.rerun()
 
     if st.session_state.cart:
-        df_cart = pd.DataFrame(st.session_state.cart)
-        st.dataframe(df_cart, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(st.session_state.cart), use_container_width=True, hide_index=True)
         subtotal = sum(x["amount"] for x in st.session_state.cart)
 
         d1, d2, d3 = st.columns(3)
@@ -441,25 +450,22 @@ elif menu == "🛒 Sale Entry":
                 pdf.ln()
             pdf.ln(3)
             pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(140, 7, "Subtotal:", 0, 0, "R")
-            pdf.cell(35, 7, f"{subtotal:.2f}", 0, 1, "R")
-            pdf.cell(140, 7, "Discount:", 0, 0, "R")
-            pdf.cell(35, 7, f"{discount:.2f}", 0, 1, "R")
+            pdf.cell(140, 7, "Subtotal:", 0, 0, "R"); pdf.cell(35, 7, f"{subtotal:.2f}", 0, 1, "R")
+            pdf.cell(140, 7, "Discount:", 0, 0, "R"); pdf.cell(35, 7, f"{discount:.2f}", 0, 1, "R")
             pdf.set_text_color(220, 38, 38)
-            pdf.cell(140, 8, "TOTAL:", 0, 0, "R")
-            pdf.cell(35, 8, f"{total:.2f}", 0, 1, "R")
+            pdf.cell(140, 8, "TOTAL:", 0, 0, "R"); pdf.cell(35, 8, f"{total:.2f}", 0, 1, "R")
             pdf.set_text_color(0)
-            pdf.cell(140, 7, "Paid:", 0, 0, "R")
-            pdf.cell(35, 7, f"{paid:.2f}", 0, 1, "R")
-            pdf.cell(140, 7, "Balance:", 0, 0, "R")
-            pdf.cell(35, 7, f"{(total-paid):.2f}", 0, 1, "R")
-
-            pdf_bytes = bytes(pdf.output())
-            b64 = base64.b64encode(pdf_bytes).decode()
+            pdf.cell(140, 7, "Paid:", 0, 0, "R"); pdf.cell(35, 7, f"{paid:.2f}", 0, 1, "R")
+            pdf.cell(140, 7, "Balance:", 0, 0, "R"); pdf.cell(35, 7, f"{(total-paid):.2f}", 0, 1, "R")
+            b64 = base64.b64encode(bytes(pdf.output())).decode()
             href = f'<a href="data:application/pdf;base64,{b64}" download="{inv_no}.pdf" target="_blank">📄 Download/Print Invoice PDF</a>'
             st.markdown(href, unsafe_allow_html=True)
 
-# ---------- PURCHASE ENTRY ----------
+
+# ============================================================
+#               PURCHASE ENTRY
+# ============================================================
+
 elif menu == "🛍️ Purchase Entry":
     st.markdown("<h1 class='big-title'>Purchase Entry</h1>", unsafe_allow_html=True)
     vendors = q("SELECT id, name FROM vendors ORDER BY name")
@@ -494,8 +500,8 @@ elif menu == "🛍️ Purchase Entry":
         st.write(""); st.write("")
         if st.button("➕ Add", key="pur_add"):
             st.session_state.p_cart.append({
-                "raw_material_id": int(r_row["id"]),
-                "name": rname, "qty": pqty, "rate": prate, "amount": pqty * prate,
+                "raw_material_id": int(r_row["id"]), "name": rname,
+                "qty": pqty, "rate": prate, "amount": pqty * prate,
             })
             st.rerun()
 
@@ -528,7 +534,11 @@ elif menu == "🛍️ Purchase Entry":
             st.session_state.p_cart = []
             st.rerun()
 
-# ---------- SALE RETURN ----------
+
+# ============================================================
+#               SALE RETURN
+# ============================================================
+
 elif menu == "↩️ Sale Return":
     st.markdown("<h1 class='big-title'>Sale Return</h1>", unsafe_allow_html=True)
     customers = q("SELECT id, name FROM customers ORDER BY name")
@@ -562,8 +572,8 @@ elif menu == "↩️ Sale Return":
         st.write(""); st.write("")
         if st.button("➕ Add", key="ret_add"):
             st.session_state.r_cart.append({
-                "product_id": int(rp_row["id"]),
-                "name": rp, "qty": rq, "rate": rr, "amount": rq * rr,
+                "product_id": int(rp_row["id"]), "name": rp,
+                "qty": rq, "rate": rr, "amount": rq * rr,
             })
             st.rerun()
 
@@ -587,7 +597,11 @@ elif menu == "↩️ Sale Return":
             st.session_state.r_cart = []
             st.rerun()
 
-# ---------- CASH / BANK ----------
+
+# ============================================================
+#               CASH / BANK
+# ============================================================
+
 elif menu == "💰 Cash / Bank":
     st.markdown("<h1 class='big-title'>Cash / Bank Transactions</h1>", unsafe_allow_html=True)
 
@@ -619,7 +633,11 @@ elif menu == "💰 Cash / Bank":
               FROM transactions ORDER BY id DESC LIMIT 50""")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ---------- STOCK ----------
+
+# ============================================================
+#               STOCK REPORT
+# ============================================================
+
 elif menu == "📦 Stock Report":
     st.markdown("<h1 class='big-title'>Stock Report</h1>", unsafe_allow_html=True)
 
@@ -638,7 +656,11 @@ elif menu == "📦 Stock Report":
             total_val2 = (df2["stock_qty"] * df2["rate"]).sum()
             st.metric("Total Raw Material Value", f"Rs. {total_val2:,.0f}")
 
-# ---------- PRODUCTION ----------
+
+# ============================================================
+#               PRODUCTION
+# ============================================================
+
 elif menu == "🏭 Production":
     st.markdown("<h1 class='big-title'>Production (with Wastage)</h1>", unsafe_allow_html=True)
     products = q("SELECT id, name FROM products ORDER BY name")
@@ -678,8 +700,8 @@ elif menu == "🏭 Production":
         st.write(""); st.write("")
         if st.button("➕ Add", key="prod_add"):
             st.session_state.prod_mats.append({
-                "raw_material_id": int(rm_row["id"]),
-                "name": rm, "qty": rm_qty, "rate": rm_rate, "amount": rm_qty * rm_rate,
+                "raw_material_id": int(rm_row["id"]), "name": rm,
+                "qty": rm_qty, "rate": rm_rate, "amount": rm_qty * rm_rate,
             })
             st.rerun()
 
@@ -699,7 +721,6 @@ elif menu == "🏭 Production":
                     (prod_id, it["raw_material_id"], it["qty"], it["rate"], it["amount"]))
                 run("UPDATE raw_materials SET stock_qty = stock_qty - ? WHERE id = ?",
                     (it["qty"], it["raw_material_id"]))
-            # Add produced qty to product stock, update cost price
             run("UPDATE products SET stock_qty = stock_qty + ?, cost_price = ? WHERE id = ?",
                 (qty_prod, total_cost / qty_prod if qty_prod else 0, pr_pid))
             st.success("✅ Production saved")
@@ -712,7 +733,11 @@ elif menu == "🏭 Production":
                 ORDER BY p.id DESC LIMIT 30""")
     st.dataframe(hist, use_container_width=True, hide_index=True)
 
-# ---------- EXPENSES ----------
+
+# ============================================================
+#               EXPENSES
+# ============================================================
+
 elif menu == "🧾 Expenses":
     st.markdown("<h1 class='big-title'>Expenses</h1>", unsafe_allow_html=True)
 
@@ -735,15 +760,19 @@ elif menu == "🧾 Expenses":
     df = q("SELECT * FROM expenses ORDER BY id DESC LIMIT 50")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ---------- LEDGER ----------
+
+# ============================================================
+#               LEDGER
+# ============================================================
+
 elif menu == "📒 Ledger":
     st.markdown("<h1 class='big-title'>Customer & Vendor Ledger</h1>", unsafe_allow_html=True)
     ltype = st.radio("Select", ["Customer", "Vendor"], horizontal=True)
     if ltype == "Customer":
-        parties = q("SELECT id, name FROM customers ORDER BY name")
+        parties = q("SELECT id, name, opening_balance FROM customers ORDER BY name")
         table_sales, field, party_type = "sales", "customer_id", "customer"
     else:
-        parties = q("SELECT id, name FROM vendors ORDER BY name")
+        parties = q("SELECT id, name, opening_balance FROM vendors ORDER BY name")
         table_sales, field, party_type = "purchases", "vendor_id", "vendor"
 
     if len(parties) == 0:
@@ -751,13 +780,18 @@ elif menu == "📒 Ledger":
         st.stop()
 
     p_name = st.selectbox(f"{ltype}", parties["name"].tolist())
-    p_id = int(parties[parties["name"] == p_name].iloc[0]["id"])
-    opening = float(parties[parties["name"] == p_name].iloc[0].get("opening_balance", 0) or 0)
+    p_row = parties[parties["name"] == p_name].iloc[0]
+    p_id = int(p_row["id"])
+    opening = float(p_row["opening_balance"] or 0)
 
-    total_debit = q(f"SELECT COALESCE(SUM(total),0) t FROM {table_sales} WHERE {field} = ?",
-                    (p_id,)).iloc[0]["t"]
-    total_paid = q("""SELECT COALESCE(SUM(amount),0) t FROM transactions
-                      WHERE party_type = ? AND party_id = ?""", (party_type, p_id)).iloc[0]["t"]
+    totals = q(f"""
+        SELECT
+            (SELECT COALESCE(SUM(total),0) FROM {table_sales} WHERE {field} = ?) as business,
+            (SELECT COALESCE(SUM(amount),0) FROM transactions
+                WHERE party_type = ? AND party_id = ?) as paid
+    """, (p_id, party_type, p_id))
+    total_debit = totals.iloc[0]["business"]
+    total_paid = totals.iloc[0]["paid"]
     balance = opening + total_debit - total_paid
 
     c1, c2, c3, c4 = st.columns(4)
@@ -772,7 +806,11 @@ elif menu == "📒 Ledger":
               ORDER BY date DESC""", (party_type, p_id))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-# ---------- REPORTS ----------
+
+# ============================================================
+#               REPORTS
+# ============================================================
+
 elif menu == "📈 Reports":
     st.markdown("<h1 class='big-title'>Reports</h1>", unsafe_allow_html=True)
     tab1, tab2, tab3, tab4 = st.tabs(["Sales", "Purchases", "Expenses", "Profit & Loss"])
@@ -799,10 +837,14 @@ elif menu == "📈 Reports":
             st.metric("Total Expenses", f"Rs. {df['amount'].sum():,.0f}")
 
     with tab4:
-        s = q("SELECT COALESCE(SUM(total),0) t FROM sales").iloc[0]["t"]
-        p = q("SELECT COALESCE(SUM(total),0) t FROM purchases").iloc[0]["t"]
-        e = q("SELECT COALESCE(SUM(amount),0) t FROM expenses").iloc[0]["t"]
-        ret = q("SELECT COALESCE(SUM(total),0) t FROM sale_returns").iloc[0]["t"]
+        pl = q("""
+            SELECT
+                (SELECT COALESCE(SUM(total),0) FROM sales) as s,
+                (SELECT COALESCE(SUM(total),0) FROM purchases) as p,
+                (SELECT COALESCE(SUM(amount),0) FROM expenses) as e,
+                (SELECT COALESCE(SUM(total),0) FROM sale_returns) as r
+        """)
+        s, p, e, ret = pl.iloc[0]["s"], pl.iloc[0]["p"], pl.iloc[0]["e"], pl.iloc[0]["r"]
         gross = s - p - ret
         net = gross - e
         st.markdown(f"""
@@ -818,7 +860,11 @@ elif menu == "📈 Reports":
         | **Net Profit** | **Rs. {net:,.0f}** |
         """)
 
-# ---------- PRODUCTS ----------
+
+# ============================================================
+#               PRODUCTS
+# ============================================================
+
 elif menu == "🍽️ Products":
     st.markdown("<h1 class='big-title'>Products (Finished Goods)</h1>", unsafe_allow_html=True)
 
@@ -869,7 +915,11 @@ elif menu == "🍽️ Products":
                 st.success("Deleted")
                 st.rerun()
 
-# ---------- RAW MATERIALS ----------
+
+# ============================================================
+#               RAW MATERIALS
+# ============================================================
+
 elif menu == "🧂 Raw Materials":
     st.markdown("<h1 class='big-title'>Raw Materials</h1>", unsafe_allow_html=True)
 
@@ -915,7 +965,11 @@ elif menu == "🧂 Raw Materials":
                 st.success("Deleted")
                 st.rerun()
 
-# ---------- CUSTOMERS ----------
+
+# ============================================================
+#               CUSTOMERS
+# ============================================================
+
 elif menu == "👥 Customers":
     st.markdown("<h1 class='big-title'>Customers</h1>", unsafe_allow_html=True)
 
@@ -963,7 +1017,11 @@ elif menu == "👥 Customers":
                 st.success("Deleted")
                 st.rerun()
 
-# ---------- VENDORS ----------
+
+# ============================================================
+#               VENDORS
+# ============================================================
+
 elif menu == "🚚 Vendors":
     st.markdown("<h1 class='big-title'>Vendors</h1>", unsafe_allow_html=True)
 
@@ -1011,7 +1069,11 @@ elif menu == "🚚 Vendors":
                 st.success("Deleted")
                 st.rerun()
 
-# ---------- MASTER SETUP ----------
+
+# ============================================================
+#               MASTER SETUP
+# ============================================================
+
 elif menu == "⚙️ Master Setup":
     st.markdown("<h1 class='big-title'>Master Setup</h1>", unsafe_allow_html=True)
     st.info("Yahan se apna password change karo, aur business info dekh sakte ho.")
@@ -1030,18 +1092,23 @@ elif menu == "⚙️ Master Setup":
 
     st.markdown("---")
     st.markdown("### 📊 Database Summary")
-    counts = {
-        "Products": q("SELECT COUNT(*) c FROM products").iloc[0]["c"],
-        "Customers": q("SELECT COUNT(*) c FROM customers").iloc[0]["c"],
-        "Vendors": q("SELECT COUNT(*) c FROM vendors").iloc[0]["c"],
-        "Raw Materials": q("SELECT COUNT(*) c FROM raw_materials").iloc[0]["c"],
-        "Sales": q("SELECT COUNT(*) c FROM sales").iloc[0]["c"],
-        "Purchases": q("SELECT COUNT(*) c FROM purchases").iloc[0]["c"],
-    }
-    for k, v in counts.items():
-        st.write(f"**{k}**: {v}")
+    counts = q("""
+        SELECT
+            (SELECT COUNT(*) FROM products) as products,
+            (SELECT COUNT(*) FROM customers) as customers,
+            (SELECT COUNT(*) FROM vendors) as vendors,
+            (SELECT COUNT(*) FROM raw_materials) as raw_materials,
+            (SELECT COUNT(*) FROM sales) as sales,
+            (SELECT COUNT(*) FROM purchases) as purchases
+    """)
+    for k, v in counts.iloc[0].items():
+        st.write(f"**{k.replace('_',' ').title()}**: {v}")
 
-# ---------- BACKUP ----------
+
+# ============================================================
+#               BACKUP / RESTORE
+# ============================================================
+
 elif menu == "💾 Backup / Restore":
     st.markdown("<h1 class='big-title'>Backup & Restore</h1>", unsafe_allow_html=True)
 
