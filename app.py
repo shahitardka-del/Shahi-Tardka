@@ -7,6 +7,7 @@ from datetime import datetime, date
 from fpdf import FPDF
 import base64
 import re
+import streamlit.components.v1 as components
 
 # ============================================================
 #               PAGE CONFIG
@@ -52,28 +53,7 @@ st.markdown("""
 #               HELPERS
 # ============================================================
 
-def safe_text(t):
-    """Remove non-latin-1 chars so fpdf doesn't crash."""
-    if t is None:
-        return ""
-    s = str(t)
-    # Replace common unicode with ascii
-    replacements = {
-        "—": "-", "–": "-", "’": "'", "‘": "'", "“": '"', "”": '"',
-        "🌶️": "", "🌶": "", "✅": "", "⚠️": "", "⚠": "", "💰": "", "📊": "",
-        "🛒": "", "🛍️": "", "↩️": "", "📦": "", "🏭": "", "🧾": "", "📒": "",
-        "📈": "", "🍽️": "", "🧂": "", "👥": "", "🚚": "", "⚙️": "", "💾": "",
-        "🖨️": "", "📥": "", "⬇️": "", "🔐": "", "➕": "", "💵": "", "🖨": "",
-    }
-    for k, v in replacements.items():
-        s = s.replace(k, v)
-    # Drop any remaining non-latin1 chars
-    s = re.sub(r"[^\x00-\xFF]", "?", s)
-    return s
-
-
 def fmt_date(d):
-    """Return date as dd-mm-yyyy."""
     if d is None:
         return ""
     if isinstance(d, str):
@@ -119,12 +99,11 @@ def run(sql, args=()):
     cur = conn.cursor()
     cur.execute(sql, args)
     conn.commit()
-    # Sirf data cache clear karo (taake fresh data aaye), function cache nahi
     q.clear()
     return cur
 
 
-@st.cache_data(ttl=300, show_spinner=False, max_entries=200)
+@st.cache_data(ttl=120, show_spinner=False, max_entries=80)
 def q(sql, args=()):
     conn = get_db()
     cur = conn.cursor()
@@ -290,7 +269,6 @@ def init_db():
         if s:
             cur.execute(s)
 
-    # Migration: add missing name columns
     for tbl, col in [("sale_items", "product_name"), ("purchase_items", "raw_name"),
                      ("sale_return_items", "product_name"), ("production_materials", "raw_name")]:
         try:
@@ -364,71 +342,95 @@ user = st.session_state.user
 
 
 # ============================================================
-#               PDF BUILDERS (FIXED for unicode)
+#               HTML BUILDERS FOR PRINT (DIRECT PRINT)
 # ============================================================
 
-def build_pdf(title, headers, rows, summary=None, extra_header=None):
-    """Build PDF safely - sanitizes all text."""
-    pdf = FPDF()
-    pdf.add_page()
+def esc(s):
+    """Escape HTML entities."""
+    if s is None:
+        return ""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
 
-    pdf.set_font("Helvetica", "B", 20)
-    pdf.set_text_color(220, 38, 38)
-    pdf.cell(0, 10, safe_text("SHAHI TARDKA"), ln=True, align="C")
 
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(100)
-    pdf.cell(0, 6, safe_text("Premium Spices & Foods"), ln=True, align="C")
-    pdf.ln(3)
-
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.set_text_color(0)
-    pdf.cell(0, 8, safe_text(title), ln=True, align="C")
-    pdf.ln(2)
-
+def html_table(headers, rows, summary=None, title="", extra_header=None):
+    """Build printable HTML string."""
+    h = """
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8">
+    <title>Print</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: Arial, Helvetica, sans-serif; padding: 20px; color: #000; }
+        .header { text-align: center; margin-bottom: 18px; }
+        .header h1 { color: #dc2626; font-size: 26px; margin: 0 0 4px 0; }
+        .header p { color: #666; margin: 0; font-size: 12px; }
+        .title { text-align: center; font-size: 18px; font-weight: bold; margin: 16px 0 10px 0; }
+        .extra { text-align: center; font-size: 12px; color: #333; margin-bottom: 12px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+        th { background: #dc2626; color: #fff; padding: 8px; font-size: 12px; border: 1px solid #b91c1c; }
+        td { padding: 7px; font-size: 12px; border: 1px solid #ccc; }
+        tr:nth-child(even) td { background: #fef2f2; }
+        .summary { text-align: right; margin-top: 14px; font-weight: bold; font-size: 13px; }
+        .summary div { margin: 3px 0; }
+        @media print {
+            @page { margin: 12mm; }
+            body { padding: 0; }
+        }
+    </style>
+    </head><body>
+    <div class="header">
+        <h1>SHAHI TARDKA</h1>
+        <p>Premium Spices &amp; Foods</p>
+    </div>
+    """
+    if title:
+        h += f'<div class="title">{esc(title)}</div>'
     if extra_header:
-        pdf.set_font("Helvetica", "", 10)
+        h += '<div class="extra">'
         for line in extra_header:
-            pdf.cell(0, 6, safe_text(line), ln=True)
-        pdf.ln(2)
+            h += f"{esc(line)}<br>"
+        h += "</div>"
 
     if headers:
-        col_w = 190 / len(headers)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.set_fill_color(220, 38, 38)
-        pdf.set_text_color(255)
-        for h in headers:
-            pdf.cell(col_w, 8, safe_text(h)[:25], 1, 0, "C", True)
-        pdf.ln()
-        pdf.set_font("Helvetica", "", 9)
-        pdf.set_text_color(0)
-        for r in rows:
-            for c in r:
-                pdf.cell(col_w, 7, safe_text(c)[:30], 1, 0, "L")
-            pdf.ln()
-        pdf.ln(3)
+        h += "<table><thead><tr>"
+        for x in headers:
+            h += f"<th>{esc(x)}</th>"
+        h += "</tr></thead><tbody>"
+        for row in rows:
+            h += "<tr>"
+            for c in row:
+                h += f"<td>{esc(c)}</td>"
+            h += "</tr>"
+        h += "</tbody></table>"
 
     if summary:
-        pdf.set_font("Helvetica", "B", 11)
-        pdf.set_text_color(220, 38, 38)
+        h += '<div class="summary">'
         for line in summary:
-            pdf.cell(0, 7, safe_text(line), ln=True, align="R")
+            h += f"<div>{esc(line)}</div>"
+        h += "</div>"
 
-    return base64.b64encode(bytes(pdf.output())).decode()
-
-
-def direct_print_button(pdf_b64, filename, label="🖨️ Print Now"):
-    html = f"""
-    <a href="data:application/pdf;base64,{pdf_b64}"
-       target="_blank"
-       onclick="setTimeout(function(){{window.print();}}, 900); return true;"
-       style="display:inline-block;background:linear-gradient(90deg,#dc2626,#b45309);
-              color:#fff;padding:12px 26px;border-radius:10px;text-decoration:none;
-              font-weight:700;font-size:15px;box-shadow:0 4px 12px rgba(220,38,38,0.3);">
-        {label}
-    </a>
+    h += """
+    <script>
+        window.onload = function() {
+            setTimeout(function() { window.print(); }, 300);
+        };
+    </script>
+    </body></html>
     """
-    st.markdown(html, unsafe_allow_html=True)
+    return h
+
+
+def direct_print(html_str, height=1):
+    """Render HTML in hidden iframe and auto-trigger window.print()."""
+    components.html(html_str, height=height, scrolling=False)
+
+
+def print_button(html_str, label="🖨️ Print Now", key=None):
+    """Button that triggers direct print when clicked."""
+    if st.button(label, key=key, use_container_width=False):
+        direct_print(html_str)
+        st.success("✅ Print dialog khul gaya — apna printer select karein")
 
 
 # ============================================================
@@ -597,48 +599,30 @@ elif menu == "🛒 Sale Entry":
         if colB.button("🗑️ Clear Cart", use_container_width=True):
             st.session_state.cart = []
             st.rerun()
+
+        # ---- PRINT INVOICE (DIRECT) ----
         if colC.button("🖨️ Print Invoice", use_container_width=True):
-            pdf = FPDF()
-            pdf.add_page()
-            pdf.set_font("Helvetica", "B", 20)
-            pdf.set_text_color(220, 38, 38)
-            pdf.cell(0, 10, safe_text("SHAHI TARDKA"), ln=True, align="C")
-            pdf.set_font("Helvetica", "", 10)
-            pdf.set_text_color(100)
-            pdf.cell(0, 6, safe_text("Premium Spices & Foods"), ln=True, align="C")
-            pdf.ln(5)
-            pdf.set_text_color(0)
-            pdf.set_font("Helvetica", "", 11)
-            pdf.cell(0, 6, safe_text(f"Invoice: {inv_no}"), ln=True)
-            pdf.cell(0, 6, safe_text(f"Date: {fmt_date(inv_date)}"), ln=True)
-            pdf.cell(0, 6, safe_text(f"Customer: {title_case(cust)}"), ln=True)
-            pdf.ln(3)
-            pdf.set_font("Helvetica", "B", 10)
-            pdf.set_fill_color(220, 38, 38)
-            pdf.set_text_color(255)
-            for w, h in [(15, "#"), (70, "Item"), (25, "Qty"), (30, "Rate"), (35, "Amount")]:
-                pdf.cell(w, 8, safe_text(h), 1, 0, "C", True)
-            pdf.ln()
-            pdf.set_text_color(0)
-            pdf.set_font("Helvetica", "", 10)
+            rows = []
             for i, it in enumerate(st.session_state.cart, 1):
-                pdf.cell(15, 7, str(i), 1)
-                pdf.cell(70, 7, safe_text(it["name"])[:35], 1)
-                pdf.cell(25, 7, str(it["qty"]), 1, 0, "R")
-                pdf.cell(30, 7, f"{it['rate']:.2f}", 1, 0, "R")
-                pdf.cell(35, 7, f"{it['amount']:.2f}", 1, 0, "R")
-                pdf.ln()
-            pdf.ln(3)
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.cell(140, 7, "Subtotal:", 0, 0, "R"); pdf.cell(35, 7, f"{subtotal:.2f}", 0, 1, "R")
-            pdf.cell(140, 7, "Discount:", 0, 0, "R"); pdf.cell(35, 7, f"{discount:.2f}", 0, 1, "R")
-            pdf.set_text_color(220, 38, 38)
-            pdf.cell(140, 8, "TOTAL:", 0, 0, "R"); pdf.cell(35, 8, f"{total:.2f}", 0, 1, "R")
-            pdf.set_text_color(0)
-            pdf.cell(140, 7, "Paid:", 0, 0, "R"); pdf.cell(35, 7, f"{paid:.2f}", 0, 1, "R")
-            pdf.cell(140, 7, "Balance:", 0, 0, "R"); pdf.cell(35, 7, f"{(total-paid):.2f}", 0, 1, "R")
-            pdf_b64 = base64.b64encode(bytes(pdf.output())).decode()
-            direct_print_button(pdf_b64, f"{inv_no}.pdf", "🖨️ Print Invoice Now")
+                rows.append([i, it["name"], f"{it['qty']:g}", f"{it['rate']:.2f}", f"{it['amount']:.2f}"])
+            html_str = html_table(
+                ["#", "Item", "Qty", "Rate", "Amount"],
+                rows,
+                summary=[
+                    f"Subtotal: Rs. {subtotal:,.2f}",
+                    f"Discount: Rs. {discount:,.2f}",
+                    f"TOTAL: Rs. {total:,.2f}",
+                    f"Paid: Rs. {paid:,.2f}",
+                    f"Balance: Rs. {(total-paid):,.2f}",
+                ],
+                title=f"Invoice: {inv_no}",
+                extra_header=[
+                    f"Date: {fmt_date(inv_date)}",
+                    f"Customer: {title_case(cust)}",
+                ],
+            )
+            direct_print(html_str)
+            st.success("✅ Print dialog khul gaya — printer select karein")
 
 
 # ============================================================
@@ -693,7 +677,7 @@ elif menu == "🛍️ Purchase Entry":
         st.metric("Total", f"Rs. {p_total:,.0f}")
         paid_p = st.number_input("Paid", min_value=0.0, value=float(p_total), key="pur_paid")
 
-        cA, cB = st.columns(2)
+        cA, cB, cC = st.columns(3)
         if cA.button("💾 Save Purchase", use_container_width=True):
             cur = run(
                 "INSERT INTO purchases (bill_no, vendor_id, date, total, paid) VALUES (?,?,?,?,?)",
@@ -719,6 +703,19 @@ elif menu == "🛍️ Purchase Entry":
         if cB.button("🗑️ Clear", use_container_width=True):
             st.session_state.p_cart = []
             st.rerun()
+        if cC.button("🖨️ Print Bill", use_container_width=True):
+            rows = []
+            for i, it in enumerate(st.session_state.p_cart, 1):
+                rows.append([i, it["name"], f"{it['qty']:g}", f"{it['rate']:.2f}", f"{it['amount']:.2f}"])
+            html_str = html_table(
+                ["#", "Item", "Qty", "Rate", "Amount"],
+                rows,
+                summary=[f"TOTAL: Rs. {p_total:,.2f}", f"Paid: Rs. {paid_p:,.2f}"],
+                title=f"Purchase Bill: {bill_no}",
+                extra_header=[f"Date: {fmt_date(p_date)}", f"Vendor: {title_case(v)}"],
+            )
+            direct_print(html_str)
+            st.success("✅ Print dialog khul gaya")
 
 
 # ============================================================
@@ -1056,20 +1053,22 @@ elif menu == "📒 Ledger":
     else:
         st.info("No Transactions In This Date Range")
 
-    if st.button("🖨️ Prepare Ledger Print"):
-        b64 = build_pdf(
-            f"{ltype} Ledger - {title_case(p_name)}",
+    # ---- PRINT LEDGER (DIRECT) ----
+    if st.button("🖨️ Print Ledger"):
+        html_str = html_table(
             ["Date", "Type", "Debit", "Credit", "Balance", "Description"],
             rows,
-            [
+            summary=[
                 f"Period: {fmt_date(date_from)} To {fmt_date(date_to)}",
                 f"Opening Balance: Rs. {opening:,.2f}",
                 f"Total Debit: Rs. {total_debit:,.2f}",
                 f"Total Credit: Rs. {total_credit:,.2f}",
                 f"Closing Balance: Rs. {balance:,.2f}",
-            ]
+            ],
+            title=f"{ltype} Ledger - {title_case(p_name)}",
         )
-        direct_print_button(b64, f"Ledger_{p_name}.pdf", "🖨️ Print Ledger Now")
+        direct_print(html_str)
+        st.success("✅ Print dialog khul gaya — printer select karein")
 
 
 # ============================================================
@@ -1434,6 +1433,15 @@ elif menu == "⚙️ Master Setup":
     """)
     for k, v in counts.iloc[0].items():
         st.write(f"**{k.replace('_',' ').title()}**: {v}")
+
+    st.markdown("---")
+    st.markdown("### 🧹 Clear Cache")
+    st.caption("Agar App Slow Lage To Yahan Se Cache Clear Karo")
+    if st.button("🗑️ Clear Cache Now"):
+        q.clear()
+        st.cache_data.clear()
+        st.success("✅ Cache Cleared — App Fresh Ho Gayi")
+        st.rerun()
 
 
 # ============================================================
