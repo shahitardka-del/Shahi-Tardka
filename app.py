@@ -89,7 +89,16 @@ def safe_float(x, default=0.0):
 
 
 # ============================================================
-#               DATABASE (FIXED)
+#               SECRETS CHECK (FIX)
+# ============================================================
+if "TURSO_URL" not in st.secrets or "TURSO_TOKEN" not in st.secrets:
+    st.error("⚠️ TURSO_URL aur TURSO_TOKEN secrets mein missing hain. "
+             "Streamlit Cloud → Settings → Secrets mein add karo.")
+    st.stop()
+
+
+# ============================================================
+#               DATABASE
 # ============================================================
 
 @st.cache_resource
@@ -121,6 +130,15 @@ def q(sql, args=()):
     return pd.DataFrame(cur.fetchall(), columns=cols)
 
 
+def q_direct(sql, args=()):
+    """FIX: Uncached read query - for login and critical operations."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(sql, args)
+    cols = [d[0] for d in cur.description] if cur.description else []
+    return pd.DataFrame(cur.fetchall(), columns=cols)
+
+
 def next_serial(prefix, table, column):
     try:
         df = q(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL")
@@ -141,7 +159,7 @@ def next_serial(prefix, table, column):
 
 
 # ============================================================
-#               DB INIT (NO CACHE - run every time)
+#               DB INIT
 # ============================================================
 
 def init_db():
@@ -290,11 +308,14 @@ def init_db():
         except Exception:
             pass
 
+    # FIX: Ensure default admin user exists
     cur.execute("SELECT COUNT(*) FROM users")
     if cur.fetchone()[0] == 0:
         pw = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
         cur.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", ("admin", pw))
+        conn.commit()
 
+    # FIX: Ensure default products exist
     cur.execute("SELECT COUNT(*) FROM products")
     if cur.fetchone()[0] == 0:
         items = [
@@ -310,13 +331,19 @@ def init_db():
                 "INSERT INTO products (name, sale_price, cost_price, stock_qty, unit) VALUES (?,?,?,?,?)",
                 (name, price, cost, stock, "Pcs"),
             )
+        conn.commit()
+
+    # FIX: Final commit to ensure everything is saved
     conn.commit()
 
 
+# FIX: Wrap init_db with proper error handling and stop
 try:
     init_db()
 except Exception as e:
-    st.error(f"DB init error: {e}")
+    st.error(f"❌ DB init error: {e}")
+    st.exception(e)
+    st.stop()
 
 
 # ============================================================
@@ -339,15 +366,34 @@ def login_page():
             p = st.text_input("Password", type="password")
             ok = st.form_submit_button("Sign In", use_container_width=True)
             if ok:
-                try:
-                    df = q("SELECT * FROM users WHERE username = ?", (u,))
-                    if len(df) and bcrypt.checkpw(p.encode(), df.iloc[0]["password_hash"].encode()):
-                        st.session_state.user = {"id": int(df.iloc[0]["id"]), "username": u}
-                        st.rerun()
-                    else:
-                        st.error("Invalid username or password")
-                except Exception as e:
-                    st.error(f"Login error: {e}")
+                # FIX: Validate empty inputs
+                if not u or not p:
+                    st.error("⚠️ Username aur Password dono likho")
+                else:
+                    try:
+                        # FIX: Use uncached q_direct for login
+                        df = q_direct(
+                            "SELECT id, username, password_hash FROM users WHERE username = ?",
+                            (u,)
+                        )
+                        if len(df) == 0:
+                            st.error("❌ Invalid username or password")
+                        else:
+                            stored_hash = df.iloc[0]["password_hash"]
+                            # FIX: Safe check for None hash
+                            if not stored_hash:
+                                st.error("❌ User ka password hash missing hai. Admin se reset karwao.")
+                            elif bcrypt.checkpw(p.encode(), str(stored_hash).encode()):
+                                st.session_state.user = {
+                                    "id": int(df.iloc[0]["id"]),
+                                    "username": str(df.iloc[0]["username"]),
+                                }
+                                st.rerun()
+                            else:
+                                st.error("❌ Invalid username or password")
+                    except Exception as e:
+                        st.error(f"❌ Login error: {e}")
+                        st.exception(e)
 
 
 if not st.session_state.user:
@@ -532,7 +578,7 @@ if menu == "📊 Dashboard":
 
 
 # ============================================================
-#               SALE ENTRY (with Unit Pcs/Kg + Weight)
+#               SALE ENTRY
 # ============================================================
 
 elif menu == "🛒 Sale Entry":
@@ -1440,7 +1486,7 @@ elif menu == "⚙️ Master Setup":
         old = st.text_input("Old Password", type="password")
         new = st.text_input("New Password", type="password")
         if st.form_submit_button("🔐 Change Password"):
-            df = q("SELECT * FROM users WHERE id=?", (user["id"],))
+            df = q_direct("SELECT * FROM users WHERE id=?", (user["id"],))
             if bcrypt.checkpw(old.encode(), df.iloc[0]["password_hash"].encode()):
                 h = bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode()
                 run("UPDATE users SET password_hash=? WHERE id=?", (h, user["id"]))
